@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 import type { AuditEntry, Targets, Watch } from '../types'
+import { settle } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
 import { describeFindings, scanScript, type Finding } from './script'
@@ -18,7 +19,9 @@ import { ghRunProgress, rolloutProgress } from './watch'
 // 3. every infra change logged with the targets of the moment (/timeline);
 // 4. read-only watches the mod polls itself, waking Claude when one ends;
 // 5. Secret values the model never sees (secrets.ts): tools that write them,
-//    commands that would print them refused, output carrying them withheld.
+//    commands that would print them refused, output carrying them withheld;
+// 6. a call the person approved in one of these dialogs runs on that answer,
+//    the permission mode not asking again (approval.ts).
 
 type Engine = EngineInterface
 type Where = { cwd: string; home: string }
@@ -38,6 +41,10 @@ const watches = atom({ plugin: 'infra-guard', key: 'watches' } as const, [] as W
 // What Claude was last told of the targets: it hears again only on a change.
 let announced = ''
 const polling = new Set<string>()
+// Bash calls the person approved in a dialog here, by tool_use_id, while they run;
+// of those, the ones the permission check asked about and this mod allowed.
+const approved = new Set<string>()
+const overruled = new Set<string>()
 
 async function where($: Engine): Promise<Where> {
   return { cwd: await $.session.cwd(), home: (await $.env.get('HOME')) ?? '' }
@@ -386,7 +393,11 @@ export const register: Register = (on, options) => {
       const scripted = await scriptGate($, e.command, w, before, prod)
       gate = { deny: scripted.deny, confirmed: [gate.confirmed, scripted.confirmed].filter(Boolean).join('; ') || undefined }
     }
-    const raw = gate.deny === undefined ? await next(e) : { deny: gate.deny }
+    // Approved in a dialog here, the call is not asked about again (tool.check below).
+    const id = gate.deny === undefined && gate.confirmed !== undefined ? e.tool_use_id : undefined
+    if (id !== undefined) approved.add(id)
+    const raw = gate.deny === undefined ? await next(e).finally(() => id !== undefined && approved.delete(id)) : { deny: gate.deny }
+    const confirmed = id !== undefined && overruled.delete(id) ? `${gate.confirmed}; the permission check asked, ${PLUGIN} allowed it` : gate.confirmed
     const ran = withheld(raw)
     const after = await refresh($)
 
@@ -398,7 +409,7 @@ export const register: Register = (on, options) => {
         command: mask(e.command),
         targets: before,
         outcome: raw.deny !== undefined ? 'refused' : raw.isError ? 'error' : gate.confirmed ? 'confirmed' : 'ok',
-        note: raw.deny !== undefined ? raw.deny.slice(0, 160) : ran.deny !== undefined ? 'output withheld' : gate.confirmed,
+        note: raw.deny !== undefined ? raw.deny.slice(0, 160) : ran.deny !== undefined ? 'output withheld' : confirmed,
         ms: (await $.clock.now()) - started,
       })
     }
@@ -409,6 +420,20 @@ export const register: Register = (on, options) => {
     announced = line
     return { ...ran, context: [...(ran.context ?? []), `${PLUGIN}: ambient targets now: ${line}`] }
   }).catch(async ($, e, next) => (next.called ? withheld(await next(e)) : { deny: `${PLUGIN}: its check failed, so the command was refused` }))
+
+  // A Bash call the person approved in a dialog here runs on that answer: an ask
+  // would go to the permission mode, in auto mode its classifier. A failure here
+  // is skipped, leaving the verdict beneath, which asks as it did before. Each
+  // allow is said in the transcript (not to Claude) and in the audit note.
+  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
+    const verdict = await next(e)
+    const settled = settle(verdict, e.tool_use_id, approved)
+    if (settled !== verdict && e.tool_use_id !== undefined) {
+      overruled.add(e.tool_use_id)
+      $.ui.log(`${PLUGIN}: allowed this command at the permission check, on your answer in its dialog`)
+    }
+    return settled
+  })
 
   // Every other tool: output carrying a known value never reaches the model.
   on('tool.call', async ($, e, next) => (e.tool === 'Bash' ? next(e) : withheld(await next(e)))).catch(() => ({

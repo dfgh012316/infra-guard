@@ -4,7 +4,7 @@ Guardrails for infrastructure work in [Claude Code](https://code.claude.com). It
 
 It is a Claude Code **mod**: a plugin with a hooks module that runs inside Claude Code, so the checks run on every tool call instead of depending on Claude remembering a rule in `CLAUDE.md`.
 
-> Status: early (0.x). Tested on the Linux CLI (WSL2) with Claude Code 2.1.301–2.1.302. macOS and the VS Code extension are untested.
+> Status: early (0.x). Tested on the Linux CLI (WSL2) with Claude Code 2.1.301–2.1.302, and on the macOS CLI with 2.1.302 against GKE (all but `secret_rotate` and `secret_set`). The VS Code extension is untested.
 
 ## Why
 
@@ -20,6 +20,7 @@ Reading that script before running it was not enough: it was read to see how it 
 | Named targets | A `kubectl` or `helm` command that changes a cluster must pass `--context` / `--kube-context` (or `HELM_KUBECONTEXT`); otherwise it is refused, with the ambient context in the reason. |
 | Script check | Before `./x.sh`, `bash x.sh` or `source x.sh` runs, the mod reads the script (and scripts it runs, two levels down) and lists every line that would act on the ambient target, switch it, or run terraform. The person decides; on a production target the button reads "Run against production". A script it cannot read is asked about too. |
 | Terraform plan gate | `terraform apply` runs only from a saved plan. The mod reads `terraform show -json` itself, counts what the plan adds, changes, replaces and destroys, lists the destroyed addresses, and asks. `terraform destroy` asks with the number of resources in state. The plan contents are not passed to Claude. |
+| Approval | A script or plan the person approved in one of these dialogs runs on that answer: the mod allows that one call at the permission check, so the permission mode (in auto mode, its classifier) does not ask about it again. Only an ask becomes an allow; a settings rule that denies the command still refuses it. Each such allow is said in a dim transcript line and in the call's audit note. |
 | Audit | Every infra change, refusal and script run is logged with the targets at the time and its outcome. `/timeline [count]` prints them newest first. Values after `--from-literal=`, `--password`, `*_TOKEN=` and similar are masked before they are stored. |
 | Watches | `watch_start` hands a Deployment rollout or a GitHub Actions run to the mod, which polls it read-only every 5 seconds and sends Claude a message when it ends, so Claude does not sleep-loop. The mod builds each watch command itself; Claude cannot pass an arbitrary one. |
 | Secret values | `secret_rotate` and `secret_set` write one key of an existing Secret after the person confirms; the value goes to `kubectl` on stdin and Claude gets key names, sizes and fingerprints. Commands that would print Secret data (`get secret -o yaml/json/jsonpath/…`, `--raw …/secrets`, `edit secret`, `exec … env`, `helm get values/manifest/all`) are refused. Any tool output carrying a value the mod minted or read, plain or base64, is withheld, and stored conversation rows carrying one are scrubbed. |
@@ -81,6 +82,7 @@ TypeScript types for the mod API are generated into `.claude-plugin/types/` when
 
 Engine behavior worth knowing:
 
+- `$.ui.ask` reaches the person in every permission mode (it is the `AskUserQuestion` tool), but the answer is not a permission approval: the call's `tool.check` still puts an `ask` to the mode's decider, in auto mode its classifier. The mod answers `allow` at `tool.check` for the one call it asked about, by `tool_use_id`.
 - `$.process.run` hands the child its stdin as a socket, so `--patch-file /dev/stdin` and `grep -f /dev/stdin` fail with `ENXIO`. Use forms that stream fd 0 (`-f -`).
 - Claude Code stores an allowed tool result's raw stdout separately in the transcript (`toolUseResult`), out of reach of `session.append`. Output has to be withheld in `tool.call`, before it is stored.
 - The runtime has `crypto.subtle.digest` but no HMAC; fingerprints use a random per-load salt with SHA-256, so they compare values within one session only.

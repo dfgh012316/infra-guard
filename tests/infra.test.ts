@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { AuditEntry } from '../types'
+import { settle } from '../hooks/approval'
 import { mask, timeline } from '../hooks/audit'
 import { scanScript } from '../hooks/script'
 import { calls, isWrite, namesTarget, scripts, switchesTarget } from '../hooks/shell'
@@ -100,6 +101,26 @@ describe('terraform', () => {
       ],
     }
     expect(summarizePlan(plan)).toEqual({ create: ['a.one'], update: ['a.two'], replace: ['a.three'], delete: ['a.four'] })
+  })
+})
+
+describe('approval', () => {
+  test('turns only an ask for a call the person approved into an allow', () => {
+    const approved = new Set(['toolu_1'])
+    expect(settle({ decision: 'ask' }, 'toolu_1', approved).decision).toBe('allow')
+    expect(settle({ decision: 'ask' }, 'toolu_2', approved).decision).toBe('ask')
+    expect(settle({ decision: 'ask' }, undefined, approved).decision).toBe('ask')
+    expect(settle({ decision: 'deny', reason: 'Bash(terraform:*)' }, 'toolu_1', approved)).toEqual({ decision: 'deny', reason: 'Bash(terraform:*)' })
+    expect(settle({ decision: 'allow' }, 'toolu_1', approved).decision).toBe('allow')
+    // The hook tells an allow it made from the verdict beneath by identity.
+    const beneath = { decision: 'ask' as const, reason: 'the mode asks' }
+    expect(settle(beneath, 'toolu_2', approved)).toBe(beneath)
+  })
+
+  test('leaves the verdict beneath a Bash check that names no call', async ($, on) => {
+    on('tool.check', () => ({ decision: 'ask', reason: 'the mode asks' }))
+    const verdict = await $.tool.check({ tool: 'Bash', input: { command: './scripts/upgrade.sh api sre' } })
+    expect(verdict.decision).toBe('ask')
   })
 })
 
