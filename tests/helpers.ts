@@ -28,13 +28,15 @@ export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok
   on('session.cwd', () => ({ value: '/w' }))
   on('session.id', () => ({ value: 'session-1' }))
   on('fs.read', ($, e) => (e.path in files ? { value: files[e.path]! } : { deny: 'missing' }))
-  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => ({
-    result: { questions: e.questions, answers: { [e.questions[0]!.question]: answer } },
-  }))
+  const asked: string[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    asked.push(e.questions[0]!.question)
+    return { result: { questions: e.questions, answers: { [e.questions[0]!.question]: answer } } }
+  })
   const ran: string[] = []
   on('tool.call', { tool: 'Bash' }, ($, e) => {
     ran.push(e.command)
     return { result: { stdout: bash(), stderr: '', interrupted: false } }
   })
-  return { ran, audit: () => (store.get('audit') as AuditEntry[] | undefined) ?? [] }
+  return { ran, asked, audit: () => (store.get('audit') as AuditEntry[] | undefined) ?? [] }
 }

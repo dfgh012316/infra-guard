@@ -23,14 +23,14 @@ Reading that script before running it was not enough: it was read to see how it 
 | Approval | A script or plan the person approved in one of these dialogs runs on that answer: the mod allows that one call at the permission check, so the permission mode (in auto mode, its classifier) does not ask about it again. Only an ask becomes an allow; a settings rule that denies the command still refuses it. Each such allow is said in a dim transcript line and in the call's audit note. |
 | Audit | Every infra change, refusal and script run is logged with the targets at the time and its outcome. `/timeline [count]` prints them newest first. Values after `--from-literal=`, `--password`, `*_TOKEN=` and similar are masked before they are stored. |
 | Watches | `watch_start` hands a Deployment rollout or a GitHub Actions run to the mod, which polls it read-only every 5 seconds and sends Claude a message when it ends, so Claude does not sleep-loop. The mod builds each watch command itself; Claude cannot pass an arbitrary one. |
-| Secret values | `secret_rotate` and `secret_set` write one key of an existing Secret after the person confirms; the value goes to `kubectl` on stdin and Claude gets key names, sizes and fingerprints. Commands that would print Secret data (`get secret -o yaml/json/jsonpath/…`, `--raw …/secrets`, `edit secret`, `exec … env`, `helm get values/manifest/all`) are refused. Any tool output carrying a value the mod minted or read, plain or base64, is withheld, and stored conversation rows carrying one are scrubbed. |
+| Secret values | `secret_rotate` mints a value and `secret_set` reads one from a file the person wrote; either writes one key of an existing Secret after the person confirms, the value goes to `kubectl` on stdin and Claude gets key names, sizes and fingerprints. Commands that would print Secret data (`get secret -o yaml/json/jsonpath/…`, `--raw …/secrets`, `edit secret`, `exec … env`, `helm get values/manifest/all`) are refused. Any tool output carrying a value the mod minted or read, plain or base64, is withheld, and stored conversation rows carrying one are scrubbed. |
 
 ### Tools Claude gets
 
 | Tool | Does |
 | --- | --- |
 | `mcp__infra-guard__secret_rotate` | Sets a key to a new random value (16–128 characters) after confirmation, then reads it back to verify. |
-| `mcp__infra-guard__secret_set` | Same, with a value the person types into the dialog (for a token a vendor issued). |
+| `mcp__infra-guard__secret_set` | Same, with the value read from a file the person wrote in their own terminal (an absolute path; one trailing newline is dropped), for a token a vendor issued. The dialog shows its length and fingerprint, never the value. Delete the file afterwards. |
 | `mcp__infra-guard__secret_keys` | Lists keys with byte sizes and session-scoped fingerprints; warns when `last-applied-configuration` holds a plaintext copy. |
 | `mcp__infra-guard__leak_check` | Searches files (default `~/.claude`) for every value the mod has seen this session and answers file names only. |
 | `mcp__infra-guard__watch_start` / `watch_stop` | Start or stop a rollout or GitHub Actions watch. |
@@ -64,7 +64,8 @@ infra-guard catches mistakes. It does not stop someone, or a model, determined t
 - **The real wall is permissions.** Give the kube identity Claude uses no `get secrets` and no production write access, and keep a privileged kubeconfig for the secret tools (they take an absolute `kubeconfig` path). The command-line guards only protect against slips.
 - **Known Secret values live in memory, for the current load only.** A reload or restart forgets them, and a value the mod never minted or read is not caught. Values shorter than 8 characters are not tracked. Multi-line values (PEM), wrapped or URL-safe base64, and partial prints can slip through.
 - **`kubectl apply` leaves old values behind.** A Secret created with `kubectl apply` keeps a plaintext copy in the `kubectl.kubernetes.io/last-applied-configuration` annotation. `secret_keys` warns about it; the mod does not remove it.
-- **A typed value is visible while typing.** The dialog has no masked input; the value goes under "Other". It is not written to the transcript or history.
+- **Dialog answers leave the machine.** In a proxy capture of Claude Code 2.1.302 signed in with claude.ai, a value typed into a dialog (under "Other") never reached the model or the local transcript, but it was sent to Anthropic in the session's event stream (`POST /v1/code/sessions/<id>/worker/events`). So `secret_set` takes a file, and the mod's dialogs carry only key names, lengths and fingerprints.
+- **The value file is yours to guard.** Claude is told only its path. The mod knows the value once it has read the file, so output carrying it is withheld from then on; a read of the file before that is not caught. Write it in your own terminal and delete it when the Secret is set.
 - **The audit log is local.** Plaintext JSON under `~/.claude/plugins/store/`, last 1000 entries, shared by sessions on the machine, not atomic and not tamper-proof. It records only commands Claude ran.
 - **Failures.** If the Bash check throws, the command is refused; if the output check throws, the output is withheld. Claude Code skips a hook whose own error handler fails, so this is not a guarantee.
 - **Mods are not sandboxed.** This one runs `kubectl`, `terraform`, `gh` and `grep` as you, and reads gcloud, gh and AWS config files. It makes no network requests of its own. Run `claude plugin validate .` to list every hook and API it uses.
@@ -82,6 +83,7 @@ TypeScript types for the mod API are generated into `.claude-plugin/types/` when
 
 Engine behavior worth knowing:
 
+- A `$.ui.ask` answer is not local: Claude Code sends it to Anthropic in the session's event stream, though it never enters the model's context. Collect secrets some other way.
 - `$.ui.ask` reaches the person in every permission mode (it is the `AskUserQuestion` tool), but the answer is not a permission approval: the call's `tool.check` still puts an `ask` to the mode's decider, in auto mode its classifier. The mod answers `allow` at `tool.check` for the one call it asked about, by `tool_use_id`.
 - `$.process.run` hands the child its stdin as a socket, so `--patch-file /dev/stdin` and `grep -f /dev/stdin` fail with `ENXIO`. Use forms that stream fd 0 (`-f -`).
 - Claude Code stores an allowed tool result's raw stdout separately in the transcript (`toolUseResult`), out of reach of `session.append`. Output has to be withheld in `tool.call`, before it is stored.

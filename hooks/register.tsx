@@ -5,7 +5,7 @@ import { settle } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
 import { describeFindings, scanScript, type Finding } from './script'
-import { carriesKnown, hasKnown, KEYS, leakCheck, listKeys, readsSecret, REDACTED, rotate, ROTATE, scrub, SET, writeKey } from './secrets'
+import { carriesKnown, hasKnown, KEYS, leakCheck, listKeys, readsSecret, REDACTED, rotate, ROTATE, scrub, SET, setFromFile } from './secrets'
 import { calls, isWrite, namesTarget, scripts, switchesTarget, type Call } from './shell'
 import { prodTargets, readTargets } from './targets'
 import { describePlan, summarizePlan, terraformRuns } from './terraform'
@@ -313,12 +313,17 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'secret_set',
       description:
-        'Sets one key of an existing Kubernetes Secret to a value the person types into a dialog (for a token a vendor issued). ' +
-        'The value goes from the dialog to kubectl and is never shown to you; you get the same report as secret_rotate.',
+        'Sets one key of an existing Kubernetes Secret to a value the person wrote to a file in their own terminal ' +
+        '(for a token a vendor issued), after they confirm. The harness reads the file and hands the value to kubectl; ' +
+        'it is never shown to you, and you must not read the file yourself. You get the same report as secret_rotate.',
       inputSchema: {
         type: 'object',
-        properties: { ...secretTarget, key: { type: 'string', description: 'key inside the Secret to set' } },
-        required: ['context', 'namespace', 'secret', 'key'],
+        properties: {
+          ...secretTarget,
+          key: { type: 'string', description: 'key inside the Secret to set' },
+          file: { type: 'string', description: 'absolute path of the file holding the value; one trailing newline is dropped' },
+        },
+        required: ['context', 'namespace', 'secret', 'key', 'file'],
       },
       isDeferred: false,
     })
@@ -363,7 +368,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__infra-guard__secret_rotate' }, ($, e) => rotate($, e as Record<string, unknown>)).catch(() => ({
     deny: `${PLUGIN}: the rotation failed before it reported`,
   }))
-  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, ($, e) => writeKey($, e as Record<string, unknown>, { kind: 'typed' })).catch(() => ({
+  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, ($, e) => setFromFile($, e as Record<string, unknown>)).catch(() => ({
     deny: `${PLUGIN}: setting the value failed before it reported`,
   }))
   on('tool.call', { tool: 'mcp__infra-guard__secret_keys' }, ($, e) => listKeys($, e as Record<string, unknown>)).catch(() => ({

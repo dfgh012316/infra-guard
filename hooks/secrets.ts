@@ -5,15 +5,15 @@ import { positionals, type Call } from './shell'
 // Kubernetes Secret values the model never sees.
 //
 // - secret_rotate mints a random value and writes it to a key of an existing
-//   Secret once the person confirms; secret_set takes one the person types.
-//   Either way the value reaches kubectl through stdin and the model gets
-//   key names, sizes and fingerprints only.
+//   Secret once the person confirms; secret_set reads one from a file the
+//   person wrote. Either way the value reaches kubectl through stdin and the
+//   model gets key names, sizes and fingerprints only.
 // - Every value minted or read here is kept in module memory, so output that
 //   carries one is withheld and stored rows carrying one are scrubbed.
 
 type Engine = EngineInterface
 type Target = { kubeconfig?: string; context: string; namespace: string; secret: string }
-type Source = { kind: 'random'; length: number } | { kind: 'typed' }
+type Source = { kind: 'random'; length: number } | { kind: 'file'; path: string }
 type SecretObject = {
   type?: string
   data?: Record<string, string>
@@ -127,9 +127,23 @@ export async function listKeys($: Engine, e: Record<string, unknown>) {
   return { result: JSON.stringify({ ...t, ...(await summary(secret)) }, null, 2) }
 }
 
-// The value comes from the mod (random) or from the person (typed under the
-// dialog's "Other"); either way it reaches kubectl through stdin alone.
+// The value comes from the mod (random) or from a file the person wrote; either
+// way it reaches kubectl through stdin alone. Never from a dialog answer:
+// Claude Code sends answers to Anthropic in the session's event stream, though
+// they never reach the model.
 async function obtain($: Engine, t: Target, key: string, source: Source): Promise<string | { deny: string }> {
+  let fromFile = ''
+  if (source.kind === 'file') {
+    try {
+      // One trailing newline is the file's, not the value's.
+      fromFile = (await $.fs.read(source.path)).replace(/\r?\n$/, '')
+    } catch {
+      return { deny: `could not read ${source.path}` }
+    }
+    if (fromFile === '') return { deny: `${source.path} holds no value` }
+    // Known from here on, even if the person cancels.
+    track(fromFile)
+  }
   try {
     if (source.kind === 'random') {
       const answer = await $.ui.ask(`Set ${key} in Secret ${where(t)} to a new random ${source.length}-character value?`, {
@@ -138,11 +152,12 @@ async function obtain($: Engine, t: Target, key: string, source: Source): Promis
       })
       return answer === 'Rotate' ? mint(source.length) : { deny: 'the person did not confirm the change' }
     }
-    const typed = await $.ui.ask(`Type the new value for ${key} in Secret ${where(t)} under Other, or cancel.`, {
+    const size = `${fromFile.length} characters, fingerprint ${await fingerprint(fromFile)}`
+    const answer = await $.ui.ask(`Set ${key} in Secret ${where(t)} to the value in ${source.path} (${size})?`, {
       header: 'Secret',
-      options: ['Cancel', 'Not now'],
+      options: ['Set', 'Cancel'],
     })
-    return typed === 'Cancel' || typed === 'Not now' || typed === '' ? { deny: 'the person did not enter a value' } : typed
+    return answer === 'Set' ? fromFile : { deny: 'the person did not confirm the change' }
   } catch {
     return { deny: 'changing a Secret needs a person in an interactive session' }
   }
@@ -180,6 +195,12 @@ export function rotate($: Engine, e: Record<string, unknown>) {
     return { deny: 'length must be an integer from 16 to 128' }
   }
   return writeKey($, e, { kind: 'random', length })
+}
+
+export function setFromFile($: Engine, e: Record<string, unknown>) {
+  const file = e.file
+  if (typeof file !== 'string' || !file.startsWith('/')) return { deny: 'file must be an absolute path' }
+  return writeKey($, e, { kind: 'file', path: file })
 }
 
 // Answers file names only: the values travel to grep on stdin.
