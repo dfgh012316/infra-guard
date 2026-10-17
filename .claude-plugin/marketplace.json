@@ -1,0 +1,8 @@
+{
+  "name": "jerrytech",
+  "description": "Claude Code plugins from JerryTech",
+  "owner": { "name": "Jerry Chuang" },
+  "plugins": [
+    { "name": "infra-guard", "source": "./" }
+  ]
+}
