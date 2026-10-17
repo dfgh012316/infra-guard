@@ -1,11 +1,27 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
-import type { AuditEntry, Targets, Watch } from '../types'
+import type { AuditEntry, PendingPaste, Targets, Watch } from '../types'
 import { settle } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
 import { describeFindings, scanScript, type Finding } from './script'
-import { carriesKnown, hasKnown, KEYS, leakCheck, listKeys, readsSecret, REDACTED, rotate, ROTATE, scrub, SET, setFromFile } from './secrets'
+import {
+  carriesKnown,
+  finishPaste,
+  hasKnown,
+  KEYS,
+  leakCheck,
+  listKeys,
+  pastePending,
+  readsSecret,
+  REDACTED,
+  rotate,
+  ROTATE,
+  scrub,
+  SET,
+  setFromFile,
+  startPaste,
+} from './secrets'
 import { calls, isWrite, namesTarget, scripts, switchesTarget, type Call } from './shell'
 import { prodTargets, readTargets } from './targets'
 import { describePlan, summarizePlan, terraformRuns } from './terraform'
@@ -37,6 +53,9 @@ const CONTEXT_FLAG: Partial<Record<Call['tool'], string>> = { kubectl: 'kubectl 
 
 const targets = atom({ plugin: 'infra-guard', key: 'targets' } as const, null as Targets | null)
 const watches = atom({ plugin: 'infra-guard', key: 'watches' } as const, [] as Watch[])
+const pending = atom({ plugin: 'infra-guard', key: 'pending' } as const, null as PendingPaste | null)
+// The pane secret_set opens for the person to paste a value into.
+const PASTE = 'secret-paste'
 
 // What Claude was last told of the targets: it hears again only on a change.
 let announced = ''
@@ -250,6 +269,54 @@ async function startWatch($: Engine, e: Record<string, unknown>) {
   }
 }
 
+// secret_set with no file: a field of the mod's own takes the value, so no
+// dialog answer (which Claude Code sends to Anthropic) carries it. The pane
+// takes the keys at once where it is placed; else the band holds the field.
+async function openPaste($: Engine, e: Record<string, unknown>) {
+  const started = await startPaste($, e)
+  if ('deny' in started) return started
+  await update($, pending, () => ({ label: started.label, inPane: true }))
+  const opened = await $.ui
+    .open({ id: PASTE, title: `${PLUGIN}: paste a Secret value`, focus: true, closeOnEscape: true, holdToasts: true, rows: 5 })
+    .catch(() => undefined)
+  // No surface at all (a -p run): nobody could paste, so nothing is left waiting.
+  if (opened === undefined || (!opened.isPlaced && opened.reason.startsWith('no-surface'))) {
+    await update($, pending, () => null)
+    await finishPaste($, undefined)
+    return { deny: 'there is no screen to paste the value into here; ask the person to write it to a file and pass `file`' }
+  }
+  if (!opened.isPlaced) await update($, pending, p => p && { ...p, inPane: false })
+  return {
+    result:
+      `Opened a field ${opened.isPlaced ? 'in a pane' : 'above the prompt (ctrl+x tab reaches it)'} where the person pastes the value for ` +
+      `${started.label}. The value goes from that field to kubectl and is never shown to you. A message arrives when it is ` +
+      'set or cancelled: do not ask for the value in chat, and do not poll or wait for it.',
+  }
+}
+
+// Ends the paste: writes a pasted value or cancels, then tells Claude, never the value.
+async function endPaste($: Engine, pasted: string | undefined, closePane: boolean) {
+  if (!pastePending() || (pasted !== undefined && pasted.replace(/\r?\n$/, '') === '')) return
+  await update($, pending, () => null)
+  if (closePane) await $.ui.close({ id: PASTE })
+  const text = await finishPaste($, pasted)
+  if (text !== undefined) await $.prompt.submit({ text: `${PLUGIN}: ${text}` })
+}
+
+// The field itself, in the pane or the band. No `value` prop: the text stays in
+// the field until Enter hands it to onSubmit, and is never drawn back.
+function pasteField($: Engine, e: Parameters<Engine['ui']['resolve']>[0], p: PendingPaste, hint: string) {
+  const { Box, Text, Input, Button } = $.ui.resolve(e)
+  if (Input === undefined) return <Text color="warning">{`${PLUGIN}: paste the value for ${p.label} from a terminal session`}</Text>
+  return (
+    <Box flexDirection="column">
+      <Text>{`Paste the new value for ${p.label}, then Enter. It goes to kubectl only; Claude never sees it.${hint}`}</Text>
+      <Input key="secret-value" label="value" placeholder="paste here" autoFocus onSubmit={value => void endPaste($, value, true)} />
+      <Button key="secret-cancel" label="Cancel" onPress={() => endPaste($, undefined, true)} />
+    </Box>
+  )
+}
+
 export const register: Register = (on, options) => {
   let prod = /prod|prd|production/i
   try {
@@ -313,17 +380,21 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'secret_set',
       description:
-        'Sets one key of an existing Kubernetes Secret to a value the person wrote to a file in their own terminal ' +
-        '(for a token a vendor issued), after they confirm. The harness reads the file and hands the value to kubectl; ' +
-        'it is never shown to you, and you must not read the file yourself. You get the same report as secret_rotate.',
+        'Sets one key of an existing Kubernetes Secret to a value the person supplies (for a token a vendor issued). ' +
+        'Without `file`, the harness opens a field where the person pastes the value, and returns at once; a message ' +
+        'arrives when it is set or cancelled. With `file`, it reads a file the person wrote and asks them to confirm. ' +
+        'The value goes to kubectl and is never shown to you: never ask for it in chat, and never read the file yourself.',
       inputSchema: {
         type: 'object',
         properties: {
           ...secretTarget,
           key: { type: 'string', description: 'key inside the Secret to set' },
-          file: { type: 'string', description: 'absolute path of the file holding the value; one trailing newline is dropped' },
+          file: {
+            type: 'string',
+            description: 'only when the person wrote the value to a file: its absolute path; one trailing newline is dropped',
+          },
         },
-        required: ['context', 'namespace', 'secret', 'key', 'file'],
+        required: ['context', 'namespace', 'secret', 'key'],
       },
       isDeferred: false,
     })
@@ -348,6 +419,11 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({ name: 'timeline', description: 'Infrastructure changes run from Claude Code, newest first', argumentHint: '[count]' })
     await refresh($)
+    // A reload forgets the paste it was waiting for; its field goes with it.
+    if ((await read($, pending)) !== null) {
+      await update($, pending, () => null)
+      await $.ui.close({ id: PASTE })
+    }
     let ticks = 0
     $.clock.every(TICK_MS, () => void tick($, ++ticks % 3 === 0))
     return next(e)
@@ -368,7 +444,10 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__infra-guard__secret_rotate' }, ($, e) => rotate($, e as Record<string, unknown>)).catch(() => ({
     deny: `${PLUGIN}: the rotation failed before it reported`,
   }))
-  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, ($, e) => setFromFile($, e as Record<string, unknown>)).catch(() => ({
+  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, ($, e) => {
+    const input = e as Record<string, unknown>
+    return input.file === undefined ? openPaste($, input) : setFromFile($, input)
+  }).catch(() => ({
     deny: `${PLUGIN}: setting the value failed before it reported`,
   }))
   on('tool.call', { tool: 'mcp__infra-guard__secret_keys' }, ($, e) => listKeys($, e as Record<string, unknown>)).catch(() => ({
@@ -464,10 +543,23 @@ export const register: Register = (on, options) => {
     return next({ ...e, message: { ...e.message, content } })
   })
 
+  // The person closing the paste pane (Esc, its close mark) cancels the paste.
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PASTE && e.origin.kind === 'person') await endPaste($, undefined, false)
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PASTE }, async ($, e) => {
+    const p = await read($, pending)
+    const { Text } = $.ui.resolve(e)
+    return p === null ? <Text dimColor>Nothing is waiting to be pasted.</Text> : pasteField($, e, p, ' Esc cancels.')
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const t = await read($, targets)
     const all = await read($, watches)
+    const paste = await read($, pending)
     const shown = [...all.filter(w => w.state === 'running'), ...all.filter(w => w.state !== 'running').slice(-FINISHED_SHOWN)]
     const { Box, Text } = $.ui.resolve(e)
     const part = (key: string, label: string, value: string | undefined) => {
@@ -492,6 +584,7 @@ export const register: Register = (on, options) => {
             {`${w.state === 'running' ? 'watching' : w.state} ${w.label}: ${w.status}`}
           </Text>
         ))}
+        {paste !== null && !paste.inPane && pasteField($, e, paste, ' ctrl+x tab reaches the field.')}
       </Box>
     )
   })

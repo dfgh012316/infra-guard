@@ -5,9 +5,10 @@ import { positionals, type Call } from './shell'
 // Kubernetes Secret values the model never sees.
 //
 // - secret_rotate mints a random value and writes it to a key of an existing
-//   Secret once the person confirms; secret_set reads one from a file the
-//   person wrote. Either way the value reaches kubectl through stdin and the
-//   model gets key names, sizes and fingerprints only.
+//   Secret once the person confirms; secret_set takes one the person pastes
+//   into the mod's own field, or reads one from a file they wrote. Either way
+//   the value reaches kubectl through stdin and the model gets key names,
+//   sizes and fingerprints only.
 // - Every value minted or read here is kept in module memory, so output that
 //   carries one is withheld and stored rows carrying one are scrubbed.
 
@@ -163,17 +164,27 @@ async function obtain($: Engine, t: Target, key: string, source: Source): Promis
   }
 }
 
-export async function writeKey($: Engine, e: Record<string, unknown>, source: Source) {
+// The Secret and key a call names, and the Secret as it is now.
+async function prepare($: Engine, e: Record<string, unknown>): Promise<{ t: Target; key: string; before: SecretObject } | { deny: string }> {
   const t = target(e)
   if (typeof t === 'string') return { deny: t }
   const key = e.key
   if (typeof key !== 'string' || !SECRET_KEY.test(key)) return { deny: 'key is not a valid Secret key' }
-
   const before = await readSecret($, t)
   if (typeof before === 'string') return { deny: before }
+  return { t, key, before }
+}
 
-  const value = await obtain($, t, key, source)
+export async function writeKey($: Engine, e: Record<string, unknown>, source: Source) {
+  const p = await prepare($, e)
+  if ('deny' in p) return p
+  const value = await obtain($, p.t, p.key, source)
   if (typeof value !== 'string') return value
+  return apply($, p.t, p.key, p.before, value)
+}
+
+// Writes `value` to `key` over the Secret as read, then reads it back.
+async function apply($: Engine, t: Target, key: string, before: SecretObject, value: string) {
   track(value)
   // The host hands stdin over a socket, which kubectl cannot open as
   // /dev/stdin; `-f -` reads it as a stream. `replace` also refuses the write
@@ -201,6 +212,38 @@ export function setFromFile($: Engine, e: Record<string, unknown>) {
   const file = e.file
   if (typeof file !== 'string' || !file.startsWith('/')) return { deny: 'file must be an absolute path' }
   return writeKey($, e, { kind: 'file', path: file })
+}
+
+// secret_set with no file: the person pastes the value into the mod's own
+// field, which no dialog answer carries. One at a time; the target waits here.
+let pasting: { t: Target; key: string } | null = null
+
+export function pastePending(): boolean {
+  return pasting !== null
+}
+
+// Checks the call and the Secret now, so a bad target fails before the field opens.
+export async function startPaste($: Engine, e: Record<string, unknown>): Promise<{ label: string } | { deny: string }> {
+  if (pasting !== null) return { deny: `a value for ${pasting.key} is already waiting to be pasted` }
+  const p = await prepare($, e)
+  if ('deny' in p) return p
+  pasting = { t: p.t, key: p.key }
+  return { label: `${p.key} in Secret ${where(p.t)}` }
+}
+
+// The pasted value (one trailing newline dropped), or undefined for a cancel:
+// what to tell Claude, which never carries the value.
+export async function finishPaste($: Engine, pasted: string | undefined): Promise<string | undefined> {
+  const p = pasting
+  if (p === null) return undefined
+  pasting = null
+  if (pasted === undefined) return `the person cancelled secret_set for ${p.key}`
+  const value = pasted.replace(/\r?\n$/, '')
+  track(value)
+  const before = await readSecret($, p.t)
+  if (typeof before === 'string') return `secret_set for ${p.key} failed: ${before}`
+  const r = await apply($, p.t, p.key, before, value)
+  return 'deny' in r ? `secret_set for ${p.key} failed: ${r.deny}` : `secret_set wrote ${p.key}: ${r.result}`
 }
 
 // Answers file names only: the values travel to grep on stdin.

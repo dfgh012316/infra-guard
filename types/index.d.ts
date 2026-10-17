@@ -23,8 +23,12 @@ export type Watch = {
   endedAt?: number
 }
 
+// A Secret value waiting to be pasted: what the field says, never the value.
+// `inPane`: the pane holds the field; otherwise the band above the prompt does.
+export type PendingPaste = { label: string; inPane: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
-    'infra-guard': { targets: Targets | null; watches: Watch[] }
+    'infra-guard': { targets: Targets | null; watches: Watch[]; pending: PendingPaste | null }
   }
 }
