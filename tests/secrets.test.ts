@@ -95,7 +95,7 @@ test('a value from a file reaches kubectl alone, and stored rows carrying it are
   expect(refused(r)).toBeUndefined()
   expect(atob((JSON.parse(written) as { data: { VENDOR: string } }).data.VENDOR)).toBe(typed)
   expect(String(r.result).includes(typed)).toBe(false)
-  // Dialog text and answers leave the machine: the value is in neither.
+  // Dialog text and answers can leave the machine (Remote Control): the value is in neither.
   expect(asked.length).toBe(1)
   expect(asked[0]).toContain('21 characters')
   expect(asked[0]!.includes(typed)).toBe(false)

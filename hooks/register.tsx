@@ -270,8 +270,9 @@ async function startWatch($: Engine, e: Record<string, unknown>) {
 }
 
 // secret_set with no file: a field of the mod's own takes the value, so no
-// dialog answer (which Claude Code sends to Anthropic) carries it. The pane
-// takes the keys at once where it is placed; else the band holds the field.
+// dialog answer (which Claude Code sends to Anthropic while Remote Control is
+// connected) carries it. The pane takes the keys at once where it is placed;
+// else the band holds the field.
 async function openPaste($: Engine, e: Record<string, unknown>) {
   const started = await startPaste($, e)
   if ('deny' in started) return started

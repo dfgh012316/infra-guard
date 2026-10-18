@@ -130,8 +130,8 @@ export async function listKeys($: Engine, e: Record<string, unknown>) {
 
 // The value comes from the mod (random) or from a file the person wrote; either
 // way it reaches kubectl through stdin alone. Never from a dialog answer:
-// Claude Code sends answers to Anthropic in the session's event stream, though
-// they never reach the model.
+// while Remote Control is connected, Claude Code sends answers to Anthropic in
+// the session's event stream, though they never reach the model.
 async function obtain($: Engine, t: Target, key: string, source: Source): Promise<string | { deny: string }> {
   let fromFile = ''
   if (source.kind === 'file') {
