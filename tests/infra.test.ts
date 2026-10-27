@@ -88,6 +88,8 @@ describe('reading command lines', () => {
     expect(tools('echo "$(kubectl delete pod x)"')).toEqual(['kubectl delete'])
     expect(tools("watch 'kubectl rollout restart deploy/app'")).toEqual(['kubectl rollout'])
     expect(tools("gcloud compute ssh vm --command 'kubectl delete pod x'")).toEqual(['gcloud compute', 'kubectl delete'])
+    expect(tools('echo probe | grep -c "kubectl patch secret"')).toEqual([])
+    expect(tools('docker exec tools sh -c "kubectl delete pod x"')).toEqual(['kubectl delete'])
   })
 
   test('reads argocd: its writes, its named target and its context switches', () => {

@@ -173,9 +173,13 @@ export function calls(line: string, cwd: string, home: string, depth = 0): Call[
       found.push({ tool: name as Tool, args: words.slice(at + 1), env, cwd: step.cwd, text: words.slice(at).join(' ') })
     }
     if (depth >= 2) continue
+    // `-c` runs its word only after a shell (`docker exec c sh -c '...'`); for
+    // grep and most other commands it is a flag of their own.
+    const shellAt = (j: number) => words.slice(at, j - 1).some(x => RUNNERS.has(x.split('/').at(-1) ?? ''))
     words.forEach((w, j) => {
       if (!/\s/.test(w)) return
-      const runs = RUNNERS.has(name) || j === at || ['-c', '--command'].includes(words[j - 1] ?? '') || /\$\(|`/.test(w)
+      const afterFlag = ['-c', '--command'].includes(words[j - 1] ?? '') && shellAt(j)
+      const runs = RUNNERS.has(name) || j === at || afterFlag || /\$\(|`/.test(w)
       if (runs) found.push(...calls(w, step.cwd, home, depth + 1))
     })
   }
