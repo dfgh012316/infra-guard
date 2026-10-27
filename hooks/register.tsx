@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 import type { AuditEntry, PendingPaste, Targets, Watch } from '../types'
-import { settle } from './approval'
+import { settle, shown } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
 import { describeFindings, scanScript, type Finding } from './script'
 import {
   carriesKnown,
+  carriesKnownIn,
   finishPaste,
   hasKnown,
   KEYS,
@@ -21,8 +22,9 @@ import {
   SET,
   setFromFile,
   startPaste,
+  type ReadOptions,
 } from './secrets'
-import { calls, isWrite, namesTarget, scripts, switchesTarget, type Call } from './shell'
+import { calls, isWrite, namesTarget, scriptRuns, switchesTarget, type Call } from './shell'
 import { prodTargets, readTargets } from './targets'
 import { describePlan, summarizePlan, terraformRuns } from './terraform'
 import { ghRunProgress, rolloutProgress } from './watch'
@@ -37,11 +39,13 @@ import { ghRunProgress, rolloutProgress } from './watch'
 // 5. Secret values the model never sees (secrets.ts): tools that write them,
 //    commands that would print them refused, output carrying them withheld;
 // 6. a call the person approved in one of these dialogs runs on that answer,
-//    the permission mode not asking again (approval.ts).
+//    the permission mode not asking again, when the dialog showed the whole
+//    command line (approval.ts).
 
 type Engine = EngineInterface
 type Where = { cwd: string; home: string }
 type Gate = { deny?: string; confirmed?: string }
+type Shown = ReturnType<typeof shown>
 
 const PLUGIN = 'infra-guard'
 const AUDIT_KEY = 'audit'
@@ -49,7 +53,7 @@ const AUDIT_LIMIT = 1000
 const TICK_MS = 5000
 const FINISHED_SHOWN = 3
 // Direct changes to a cluster must say which one; a script is asked about instead.
-const CONTEXT_FLAG: Partial<Record<Call['tool'], string>> = { kubectl: 'kubectl --context', helm: 'helm --kube-context' }
+const CONTEXT_FLAG: Partial<Record<Call['tool'], string>> = { kubectl: 'kubectl --context', helm: 'helm --kube-context', argocd: 'argocd --argocd-context' }
 
 const targets = atom({ plugin: 'infra-guard', key: 'targets' } as const, null as Targets | null)
 const watches = atom({ plugin: 'infra-guard', key: 'watches' } as const, [] as Watch[])
@@ -91,25 +95,33 @@ function list(items: string[]): string {
   return `${items.slice(0, 8).join(', ')}${items.length > 8 ? ', …' : ''}`
 }
 
-async function terraformGate($: Engine, command: string, w: Where): Promise<Gate> {
+async function terraformGate($: Engine, command: string, w: Where, line: Shown): Promise<Gate> {
   const confirmed: string[] = []
   for (const run of terraformRuns(command, w.cwd, w.home)) {
+    const dir = short(run.dir, w.home)
+    if (run.isAll) {
+      return {
+        deny:
+          `${PLUGIN}: refused ${run.tool} ${run.verb} across every module in ${dir}: there is no one plan to show the person. ` +
+          `Plan each module with \`${run.tool} plan -out=tfplan\` and apply it from that plan, or let the person run it with \`!\`.`,
+      }
+    }
     if (run.verb === 'apply' && run.plan === undefined) {
       return {
         deny:
-          `${PLUGIN}: refused terraform apply without a saved plan. Run \`terraform plan -out=tfplan\`, ` +
-          'show the person what it changes, then `terraform apply tfplan`.',
+          `${PLUGIN}: refused ${run.tool} apply without a saved plan. Run \`${run.tool} plan -out=tfplan\`, ` +
+          `show the person what it changes, then \`${run.tool} apply tfplan\`.`,
       }
     }
-    const dir = short(run.dir, w.home)
     if (run.verb === 'apply' && run.plan !== undefined) {
-      const shown = await $.process.run(['terraform', 'show', '-json', run.plan], { cwd: run.dir, timeoutMs: 60_000 })
-      if (shown.exitCode !== 0) return { deny: `${PLUGIN}: could not read the plan ${run.plan}: ${shown.stderr.trim().slice(0, 300)}` }
-      const s = summarizePlan(JSON.parse(shown.stdout))
+      const plan = await $.process.run([run.tool, 'show', '-json', run.plan], { cwd: run.dir, timeoutMs: 60_000 })
+      if (plan.exitCode !== 0) return { deny: `${PLUGIN}: could not read the plan ${run.plan}: ${plan.stderr.trim().slice(0, 300)}` }
+      const s = summarizePlan(JSON.parse(plan.stdout))
       const losses = [...s.replace, ...s.delete]
       const question = [
-        `terraform apply ${run.plan} in ${dir}: ${describePlan(s)}.`,
+        `${run.tool} apply ${run.plan} in ${dir}: ${describePlan(s)}.`,
         ...(losses.length > 0 ? [`Destroys: ${list(losses)}`] : []),
+        `Command: ${line.text}`,
         'Apply it?',
       ].join('\n')
       if (!(await ask($, question, losses.length > 0 ? `Apply, destroying ${losses.length}` : 'Apply'))) {
@@ -118,23 +130,28 @@ async function terraformGate($: Engine, command: string, w: Where): Promise<Gate
       confirmed.push(describePlan(s))
       continue
     }
-    const state = await $.process.run(['terraform', 'state', 'list'], { cwd: run.dir, timeoutMs: 60_000 })
+    const state = await $.process.run([run.tool, 'state', 'list'], { cwd: run.dir, timeoutMs: 60_000 })
     const items = state.stdout.split('\n').filter(Boolean)
-    const question = `terraform destroy in ${dir} deletes all ${items.length} resources in its state${items.length > 0 ? `: ${list(items)}` : ''}. Destroy?`
-    if (!(await ask($, question, `Destroy ${items.length}`))) return { deny: `${PLUGIN}: the person did not approve terraform destroy` }
+    const question = [
+      `${run.tool} destroy in ${dir} deletes all ${items.length} resources in its state${items.length > 0 ? `: ${list(items)}` : ''}.`,
+      `Command: ${line.text}`,
+      'Destroy?',
+    ].join('\n')
+    if (!(await ask($, question, `Destroy ${items.length}`))) return { deny: `${PLUGIN}: the person did not approve ${run.tool} destroy` }
     confirmed.push(`destroy of ${items.length}`)
   }
   return confirmed.length > 0 ? { confirmed: confirmed.join('; ') } : {}
 }
 
-// Reads each script the line runs (and those it runs, two levels down).
-async function scriptGate($: Engine, command: string, w: Where, t: Targets | null, prod: RegExp): Promise<Gate> {
-  const queue = scripts(command, w.cwd, w.home).map(path => ({ path, depth: 0 }))
+// Reads each script the line runs (and those it runs, two levels down), each
+// from the directory it runs in.
+async function scriptGate($: Engine, command: string, w: Where, t: Targets | null, prod: RegExp, line: Shown): Promise<Gate> {
+  const queue = scriptRuns(command, w.cwd, w.home).map(run => ({ ...run, depth: 0 }))
   const seen = new Set<string>()
   const findings: Finding[] = []
   const unread: string[] = []
   while (queue.length > 0) {
-    const { path, depth } = queue.shift()!
+    const { path, cwd, depth } = queue.shift()!
     if (seen.has(path)) continue
     seen.add(path)
     let text: string
@@ -144,9 +161,9 @@ async function scriptGate($: Engine, command: string, w: Where, t: Targets | nul
       unread.push(path)
       continue
     }
-    const scan = scanScript(path, text, w.home)
+    const scan = scanScript(path, text, w.home, cwd)
     findings.push(...scan.findings)
-    if (depth < 2) queue.push(...scan.nested.map(p => ({ path: p, depth: depth + 1 })))
+    if (depth < 2) queue.push(...scan.nested.map(run => ({ ...run, depth: depth + 1 })))
   }
   if (findings.length === 0 && unread.length === 0) return {}
   const onProd = prodTargets(t, prod)
@@ -155,6 +172,7 @@ async function scriptGate($: Engine, command: string, w: Where, t: Targets | nul
     ...describeFindings(findings, w.home),
     ...unread.map(p => `could not read ${short(p, w.home)} to check it`),
     `Ambient now: ${targetLine(t)}${onProd.length > 0 ? `  (PRODUCTION: ${onProd.join(', ')})` : ''}`,
+    `Command: ${line.text}`,
     'Run it?',
   ].join('\n')
   if (!(await ask($, question, onProd.length > 0 ? 'Run against production' : 'Run it'))) {
@@ -204,15 +222,16 @@ async function tick($: Engine, withTargets: boolean) {
   for (const w of await read($, watches)) if (w.state === 'running' && !polling.has(w.id)) void poll($, w, now)
 }
 
-function directGate(found: Call[], t: Targets | null): Gate {
+function directGate(found: Call[], t: Targets | null, read: ReadOptions): Gate {
   for (const call of found) {
-    const why = readsSecret(call)
+    const why = readsSecret(call, read)
     if (why !== undefined) return { deny: `${PLUGIN}: refused, ${why}. List keys with ${KEYS}; change a value with ${ROTATE} or ${SET}.` }
   }
   for (const call of found) {
     const flag = CONTEXT_FLAG[call.tool]
     if (flag !== undefined && isWrite(call) && !namesTarget(call)) {
-      return { deny: `${PLUGIN}: refused, a command that changes a cluster must name its target with ${flag} (ambient kube-context: ${t?.kube ?? 'unset'}).` }
+      const ambient = call.tool === 'argocd' ? `ambient argocd context: ${t?.argocd ?? 'unset'}` : `ambient kube-context: ${t?.kube ?? 'unset'}`
+      return { deny: `${PLUGIN}: refused, a command that changes a cluster must name its target with ${flag} (${ambient}).` }
     }
   }
   return {}
@@ -220,11 +239,26 @@ function directGate(found: Call[], t: Targets | null): Gate {
 
 type Ran = { deny?: string; text?: string; result?: unknown }
 
-// Output carrying a Secret value this mod minted or read never reaches the model.
+// Output carrying a Secret value this mod minted or read never reaches the
+// model (which reads that the tool ran and a plugin withheld its result).
 function withheld<R extends Ran>(ran: R): R | { deny: string } {
   if (ran.deny !== undefined || !hasKnown()) return ran
-  if (!carriesKnown(`${ran.text ?? ''}\n${JSON.stringify(ran.result ?? null)}`)) return ran
+  if (!carriesKnown(ran.text ?? '') && !carriesKnownIn(ran.result)) return ran
   return { deny: `${PLUGIN}: the output carried a Secret value this guard manages, so it was withheld` }
+}
+
+// The secret tools' writes in the audit log beside the Bash ones.
+async function recordSecretWrite($: Engine, tool: string, e: Record<string, unknown>, r: { deny?: string; result?: unknown }, started: number) {
+  await record($, {
+    at: new Date(started).toISOString(),
+    session: await $.session.id(),
+    cwd: await $.session.cwd(),
+    command: `${tool} ${String(e.namespace)}/${String(e.secret)} key ${String(e.key)} on context ${String(e.context)}`.slice(0, 400),
+    targets: await read($, targets),
+    outcome: r.deny !== undefined ? 'refused' : 'ok',
+    note: r.deny?.slice(0, 160),
+    ms: (await $.clock.now()) - started,
+  })
 }
 
 async function startWatch($: Engine, e: Record<string, unknown>) {
@@ -283,6 +317,7 @@ async function openPaste($: Engine, e: Record<string, unknown>) {
   // No surface at all (a -p run): nobody could paste, so nothing is left waiting.
   if (opened === undefined || (!opened.isPlaced && opened.reason.startsWith('no-surface'))) {
     await update($, pending, () => null)
+    // Not logged: nothing was asked of the person.
     await finishPaste($, undefined)
     return { deny: 'there is no screen to paste the value into here; ask the person to write it to a file and pass `file`' }
   }
@@ -295,19 +330,26 @@ async function openPaste($: Engine, e: Record<string, unknown>) {
   }
 }
 
-// Ends the paste: writes a pasted value or cancels, then tells Claude, never the value.
+// Ends the paste: writes a pasted value or cancels, logs it, then tells Claude, never the value.
 async function endPaste($: Engine, pasted: string | undefined, closePane: boolean) {
   if (!pastePending() || (pasted !== undefined && pasted.replace(/\r?\n$/, '') === '')) return
   await update($, pending, () => null)
   if (closePane) await $.ui.close({ id: PASTE })
-  const text = await finishPaste($, pasted)
-  if (text !== undefined) await $.prompt.submit({ text: `${PLUGIN}: ${text}` })
+  const started = await $.clock.now()
+  const ended = await finishPaste($, pasted)
+  if (ended === undefined) return
+  const r = ended.written ? { result: ended.text } : { deny: ended.text }
+  await recordSecretWrite($, 'secret_set', ended.call, r, started).catch(() => undefined)
+  await $.prompt.submit({ text: `${PLUGIN}: ${ended.text}` })
 }
 
 // The field itself, in the pane or the band. No `value` prop: the text stays in
 // the field until Enter hands it to onSubmit, and is never drawn back.
 function pasteField($: Engine, e: Parameters<Engine['ui']['resolve']>[0], p: PendingPaste, hint: string) {
-  const { Box, Text, Input, Button } = $.ui.resolve(e)
+  const table = $.ui.resolve(e)
+  const { Box, Text, Button } = table
+  // Not every surface has a field (mobile has none).
+  const Input = 'Input' in table ? table.Input : undefined
   if (Input === undefined) return <Text color="warning">{`${PLUGIN}: paste the value for ${p.label} from a terminal session`}</Text>
   return (
     <Box flexDirection="column">
@@ -325,6 +367,7 @@ export const register: Register = (on, options) => {
   } catch {
     // An unreadable pattern keeps the default.
   }
+  const reads: ReadOptions = { allowHelmGet: options.allowHelmGet === true }
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -442,12 +485,21 @@ export const register: Register = (on, options) => {
     return { result: `stopped ${String(id)}` }
   }).catch(() => ({ deny: `${PLUGIN}: stopping the watch failed` }))
 
-  on('tool.call', { tool: 'mcp__infra-guard__secret_rotate' }, ($, e) => rotate($, e as Record<string, unknown>)).catch(() => ({
+  on('tool.call', { tool: 'mcp__infra-guard__secret_rotate' }, async ($, e) => {
+    const started = await $.clock.now()
+    const r = await rotate($, e as Record<string, unknown>)
+    await recordSecretWrite($, 'secret_rotate', e as Record<string, unknown>, r, started).catch(() => undefined)
+    return r
+  }).catch(() => ({
     deny: `${PLUGIN}: the rotation failed before it reported`,
   }))
-  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, ($, e) => {
+  on('tool.call', { tool: 'mcp__infra-guard__secret_set' }, async ($, e) => {
     const input = e as Record<string, unknown>
-    return input.file === undefined ? openPaste($, input) : setFromFile($, input)
+    const started = await $.clock.now()
+    // An opened field is logged when the paste ends (endPaste); a refusal now.
+    const r = input.file === undefined ? await openPaste($, input) : await setFromFile($, input)
+    if (input.file !== undefined || 'deny' in r) await recordSecretWrite($, 'secret_set', input, r, started).catch(() => undefined)
+    return r
   }).catch(() => ({
     deny: `${PLUGIN}: setting the value failed before it reported`,
   }))
@@ -467,22 +519,29 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const w = await where($)
     const found = calls(e.command, w.cwd, w.home)
-    const runs = scripts(e.command, w.cwd, w.home)
+    const runs = scriptRuns(e.command, w.cwd, w.home)
     if (found.length === 0 && runs.length === 0) return withheld(await next(e))
 
     const started = await $.clock.now()
     const before = (await read($, targets)) ?? (await refresh($))
-    let gate = directGate(found, before)
-    if (gate.deny === undefined) gate = await terraformGate($, e.command, w)
+    const asShown = shown(e.command)
+    let gate = directGate(found, before, reads)
+    if (gate.deny === undefined) gate = await terraformGate($, e.command, w, asShown)
     if (gate.deny === undefined && runs.length > 0) {
-      const scripted = await scriptGate($, e.command, w, before, prod)
+      const scripted = await scriptGate($, e.command, w, before, prod, asShown)
       gate = { deny: scripted.deny, confirmed: [gate.confirmed, scripted.confirmed].filter(Boolean).join('; ') || undefined }
     }
-    // Approved in a dialog here, the call is not asked about again (tool.check below).
-    const id = gate.deny === undefined && gate.confirmed !== undefined ? e.tool_use_id : undefined
+    // Approved in a dialog that showed the whole line, the call is not asked
+    // about again (tool.check below); a line too long to show is.
+    const id = gate.deny === undefined && gate.confirmed !== undefined && asShown.whole ? e.tool_use_id : undefined
     if (id !== undefined) approved.add(id)
     const raw = gate.deny === undefined ? await next(e).finally(() => id !== undefined && approved.delete(id)) : { deny: gate.deny }
-    const confirmed = id !== undefined && overruled.delete(id) ? `${gate.confirmed}; the permission check asked, ${PLUGIN} allowed it` : gate.confirmed
+    const confirmed =
+      id !== undefined && overruled.delete(id)
+        ? `${gate.confirmed}; the permission check asked, ${PLUGIN} allowed it`
+        : gate.confirmed !== undefined && !asShown.whole
+          ? `${gate.confirmed}; too long to show whole, left to the permission check`
+          : gate.confirmed
     const ran = withheld(raw)
     const after = await refresh($)
 
@@ -491,7 +550,7 @@ export const register: Register = (on, options) => {
         at: new Date(started).toISOString(),
         session: await $.session.id(),
         cwd: w.cwd,
-        command: mask(e.command),
+        command: mask(scrub(e.command)),
         targets: before,
         outcome: raw.deny !== undefined ? 'refused' : raw.isError ? 'error' : gate.confirmed ? 'confirmed' : 'ok',
         note: raw.deny !== undefined ? raw.deny.slice(0, 160) : ran.deny !== undefined ? 'output withheld' : confirmed,
@@ -579,6 +638,7 @@ export const register: Register = (on, options) => {
           {part('gcloud', 'gcloud', t?.gcloud)}
           {part('gh', 'gh', t?.gh)}
           {part('aws', 'aws', t?.aws)}
+          {part('argocd', 'argocd', t?.argocd)}
         </Box>
         {shown.map(w => (
           <Text key={w.id} color={w.state === 'running' ? 'suggestion' : w.state === 'done' ? 'success' : 'warning'}>

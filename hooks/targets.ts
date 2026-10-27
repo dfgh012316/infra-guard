@@ -69,10 +69,23 @@ async function aws($: Engine, home: string): Promise<string | undefined> {
   return config ? 'default' : undefined
 }
 
+// argocd keeps its config in ARGOCD_CONFIG_DIR, else the legacy ~/.argocd
+// when it exists, else the XDG folder; ARGOCD_SERVER overrides the context.
+async function argocd($: Engine, home: string): Promise<string | undefined> {
+  const server = await $.env.get('ARGOCD_SERVER')
+  if (server) return `${server} (env)`
+  const dir = await $.env.get('ARGOCD_CONFIG_DIR')
+  const xdg = (await $.env.get('XDG_CONFIG_HOME')) ?? `${home}/.config`
+  const config = dir
+    ? await readText($, `${dir}/config`)
+    : ((await readText($, `${home}/.argocd/config`)) ?? (await readText($, `${xdg}/argocd/config`)))
+  return config ? /^current-context:\s*['"]?([^\s'"]+)/m.exec(config)?.[1] : undefined
+}
+
 export async function readTargets($: Engine): Promise<Targets> {
   const home = (await $.env.get('HOME')) ?? ''
-  const [k, g, h, a] = await Promise.all([kube($), gcloud($, home), gh($, home), aws($, home)])
-  return { kube: k, gcloud: g, gh: h, aws: a }
+  const [k, g, h, a, cd] = await Promise.all([kube($), gcloud($, home), gh($, home), aws($, home), argocd($, home)])
+  return { kube: k, gcloud: g, gh: h, aws: a, argocd: cd }
 }
 
 export function prodTargets(t: Targets | null, pattern: RegExp): string[] {

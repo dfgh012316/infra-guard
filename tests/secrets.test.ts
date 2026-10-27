@@ -1,10 +1,12 @@
+import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+import { leakPatterns, managedBy } from '../hooks/secrets'
 import { engine, exited, refused } from './helpers'
 
 const ROTATE = 'mcp__infra-guard__secret_rotate'
 const SET = 'mcp__infra-guard__secret_set'
 
-test('refuses kubectl and helm commands that print Secret data', async ($, on) => {
+test('refuses commands that print Secret data', async ($, on) => {
   const { ran } = engine(on)
   for (const command of [
     'kubectl get secret app -o yaml',
@@ -13,6 +15,12 @@ test('refuses kubectl and helm commands that print Secret data', async ($, on) =
     'kubectl get --raw /api/v1/namespaces/popo/secrets/popofinder',
     'kubectl exec deploy/api -- printenv',
     'helm get manifest api -n popo',
+    "kubectl --context dev get secret app --template '{{.data.password}}'",
+    "kubectl --context dev exec deploy/api -- sh -c 'echo $DB_PASSWORD'",
+    'kubectl --context dev exec api-0 -- cat /etc/secrets/token',
+    'gcloud secrets versions access latest --secret=telegram',
+    'aws secretsmanager get-secret-value --secret-id app',
+    'aws ssm get-parameter --name /app/db --with-decryption',
   ]) {
     const r = await $.tool.call({ tool: 'Bash', command })
     expect(refused(r)).toContain('refused')
@@ -22,17 +30,36 @@ test('refuses kubectl and helm commands that print Secret data', async ($, on) =
 
 test('lets read-only and explicitly targeted commands through', async ($, on) => {
   const { ran } = engine(on)
-  for (const command of [
+  const commands = [
     'kubectl get pods -o yaml',
     'kubectl get secrets',
     'kubectl describe secret app',
     'kubectl --context k3d-ksg-spike -n spike rollout restart deploy/app',
     'helm upgrade --install api ./chart --kube-context staging',
-  ]) {
+    'kubectl --context dev exec deploy/api -- ls /tmp',
+    'gcloud secrets versions list --secret=telegram',
+    'grep -rnE "kubectl patch secret|helm get values" docs/',
+  ]
+  for (const command of commands) {
     const r = await $.tool.call({ tool: 'Bash', command })
     expect(refused(r)).toBeUndefined()
   }
-  expect(ran.length).toBe(5)
+  expect(ran.length).toBe(commands.length)
+})
+
+test('lets helm get through where the person turned it on', { options: { allowHelmGet: true } }, async ($, on) => {
+  const { ran } = engine(on)
+  const r = await $.tool.call({ tool: 'Bash', command: 'helm get values api -n popo --kube-context dev' })
+  expect(refused(r)).toBeUndefined()
+  expect(ran.length).toBe(1)
+})
+
+test('refuses kubectl exec that leaves the kube context ambient', async ($, on) => {
+  const { ran } = engine(on)
+  on('process.run', () => exited(0, 'prod-cluster\n'))
+  const r = await $.tool.call({ tool: 'Bash', command: 'kubectl exec deploy/api -- rm -rf /data' })
+  expect(refused(r)).toContain('ambient kube-context: prod-cluster')
+  expect(ran.length).toBe(0)
 })
 
 test('refuses a direct cluster change that leaves the kube context ambient', async ($, on) => {
@@ -71,6 +98,71 @@ test('rotates without returning the value, then withholds output that carries it
   echoed.push(`TOKEN=${atob(minted)}`)
   const leak = await $.tool.call({ tool: 'Bash', command: 'cat .env' })
   expect(refused(leak)).toContain('withheld')
+})
+
+test('logs a rotation, and keeps known values out of logged commands', async ($, on) => {
+  let stored: Record<string, string> = {}
+  let written = ''
+  const { audit } = engine(on, { answer: 'Rotate' })
+  on('process.run', ($, e) => {
+    const verb = e.argv[5]
+    if (verb === 'get') return exited(0, JSON.stringify({ type: 'Opaque', data: stored }))
+    if (verb === 'replace') {
+      written = e.init?.stdin ?? ''
+      stored = (JSON.parse(written) as { data: Record<string, string> }).data
+      return exited(0, 'secret/app replaced')
+    }
+    return exited(0, 'dev\n')
+  })
+  await $.tool.call({ tool: ROTATE, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'TOKEN' })
+  expect(audit().at(-1)?.command).toBe('secret_rotate spike/app key TOKEN on context k3d-ksg-spike')
+  expect(audit().at(-1)?.outcome).toBe('ok')
+
+  const value = atob((JSON.parse(written) as { data: { TOKEN: string } }).data.TOKEN)
+  await $.tool.call({ tool: 'Bash', command: `kubectl --context k3d-ksg-spike -n spike annotate deploy/app copied=${value}` })
+  expect(audit().at(-1)?.command.includes(value)).toBe(false)
+})
+
+test('withholds output carrying a multi-line value', async ($, on) => {
+  const typed = 'line-one-abcdefgh\nline-two-ijklmnop'
+  let stored: Record<string, string> = {}
+  engine(on, { answer: 'Set', files: { '/home/u/cert.pem': `${typed}\n` }, bash: () => `cert:\n${typed}\n` })
+  on('process.run', ($, e) => {
+    if (e.argv[5] === 'get') return exited(0, JSON.stringify({ type: 'Opaque', data: stored }))
+    if (e.argv[5] === 'replace') {
+      stored = (JSON.parse(e.init?.stdin ?? '{}') as { data: Record<string, string> }).data
+      return exited(0, 'secret/app replaced')
+    }
+    return exited(1, '', 'unexpected')
+  })
+  await $.tool.call({ tool: SET, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'CERT', file: '/home/u/cert.pem' })
+  expect(atob(stored.CERT ?? '')).toBe(typed)
+  const r = await $.tool.call({ tool: 'Bash', command: 'cat cert.pem' })
+  expect(refused(r)).toContain('withheld')
+})
+
+test('refuses to write a Secret that a controller writes back', async ($, on) => {
+  let replaced = false
+  engine(on, { answer: 'Rotate' })
+  const owned = {
+    type: 'Opaque',
+    data: {},
+    metadata: { ownerReferences: [{ kind: 'ExternalSecret', name: 'app', controller: true }] },
+  }
+  on('process.run', ($, e) => {
+    if (e.argv[5] === 'replace') replaced = true
+    return exited(0, JSON.stringify(owned))
+  })
+  const r = await $.tool.call({ tool: ROTATE, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'TOKEN' })
+  expect(refused(r)).toContain('managed by ExternalSecret app')
+  expect(replaced).toBe(false)
+  expect(managedBy({ metadata: { annotations: { 'reconcile.external-secrets.io/data-hash': 'x' } } })).toBe('External Secrets')
+  expect(managedBy({ metadata: { ownerReferences: [{ kind: 'Deployment', name: 'app' }] } })).toBeUndefined()
+})
+
+test('looks for a PEM line by line, never for an empty or armor line', () => {
+  const pem = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nshort\n-----END CERTIFICATE-----\n'
+  expect(leakPatterns([pem])).toEqual(['MIIBszCCAVmgAwIBAgIU'])
 })
 
 test('a value from a file reaches kubectl alone, and stored rows carrying it are scrubbed', async ($, on) => {
@@ -139,11 +231,11 @@ test('secret_set needs an absolute path to a readable, non-empty file', async ($
 
 // The paste field: a pane where one is placed, else the band above the prompt.
 const PANE = { title: 'infra-guard', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 5 }, view: {} } as const
-const BAND = { hasSurvey: false, isWorking: true, maxRows: 12 } as const
+const BAND = { hasSurvey: false, isWorking: true, maxRows: 12, bodyColumns: 80, scroll: { offset: 0, bodyRows: 12 }, view: {} } as const
 const TARGET = { tool: SET, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'VENDOR' } as const
 
 // A cluster of one Secret, the pane's placement, and what reaches Claude.
-function pasting(on: Parameters<Parameters<typeof test>[1]>[1], { placed }: { placed: boolean }) {
+function pasting(on: On, { placed }: { placed: boolean }) {
   const state = { placed: placed as boolean | 'no-surface', stored: {} as Record<string, string>, written: '', closed: [] as string[], told: [] as string[] }
   on('process.run', ($, e) => {
     const verb = e.argv[5]
@@ -228,4 +320,32 @@ test('with no screen to paste into, secret_set leaves nothing waiting', async ($
   expect(s.told.length).toBe(0)
   s.placed = true
   expect(refused(await $.tool.call(TARGET))).toBeUndefined()
+})
+
+test('a paste is logged when it ends, without the value', async ($, on) => {
+  const value = 'pasted-token-9e4c1a57'
+  const { audit } = engine(on)
+  pasting(on, { placed: true })
+  await $.tool.call(TARGET)
+  expect(audit().length).toBe(0)
+  const ui = await $.ui.mount({ plugin: 'infra-guard', surface: 'terminal', component: 'Pane', requestId: 'secret-paste', props: PANE })
+  await ui.input({ key: 'secret-value', text: value })
+  expect(audit().at(-1)?.command).toBe('secret_set spike/app key VENDOR on context k3d-ksg-spike')
+  expect(audit().at(-1)?.outcome).toBe('ok')
+  expect(JSON.stringify(audit()).includes(value)).toBe(false)
+})
+
+test('no field opens for a Secret a controller writes back', async ($, on) => {
+  const { audit } = engine(on)
+  let opened = 0
+  on('process.run', () =>
+    exited(0, JSON.stringify({ type: 'Opaque', data: {}, metadata: { annotations: { 'reconcile.external-secrets.io/data-hash': 'x' } } })),
+  )
+  on('ui.open', () => {
+    opened++
+    return { value: { isPlaced: true } }
+  })
+  expect(refused(await $.tool.call(TARGET))).toContain('managed by External Secrets')
+  expect(opened).toBe(0)
+  expect(audit().at(-1)?.outcome).toBe('refused')
 })

@@ -1,4 +1,4 @@
-export type Targets = { kube?: string; gcloud?: string; gh?: string; aws?: string }
+export type Targets = { kube?: string; gcloud?: string; gh?: string; aws?: string; argocd?: string }
 
 export type AuditEntry = {
   at: string

@@ -18,7 +18,12 @@ type Source = { kind: 'random'; length: number } | { kind: 'file'; path: string 
 type SecretObject = {
   type?: string
   data?: Record<string, string>
-  metadata?: { resourceVersion?: string; annotations?: Record<string, string> }
+  metadata?: {
+    resourceVersion?: string
+    annotations?: Record<string, string>
+    labels?: Record<string, string>
+    ownerReferences?: { kind: string; name: string; controller?: boolean }[]
+  }
 }
 
 export const ROTATE = 'mcp__infra-guard__secret_rotate'
@@ -49,6 +54,15 @@ export function hasKnown(): boolean {
 
 export function carriesKnown(text: string): boolean {
   for (const value of known) if (text.includes(value)) return true
+  return false
+}
+
+// Each string inside a tool's result, read as it is, not as JSON: a value
+// with a newline (a PEM) is escaped in JSON and would not match there.
+export function carriesKnownIn(value: unknown): boolean {
+  if (typeof value === 'string') return carriesKnown(value)
+  if (Array.isArray(value)) return value.some(carriesKnownIn)
+  if (value !== null && typeof value === 'object') return Object.values(value).some(carriesKnownIn)
   return false
 }
 
@@ -172,7 +186,15 @@ async function prepare($: Engine, e: Record<string, unknown>): Promise<{ t: Targ
   if (typeof key !== 'string' || !SECRET_KEY.test(key)) return { deny: 'key is not a valid Secret key' }
   const before = await readSecret($, t)
   if (typeof before === 'string') return { deny: before }
+  const owned = refuseManaged(t, before)
+  if (owned !== undefined) return { deny: owned }
   return { t, key, before }
+}
+
+function refuseManaged(t: Target, secret: SecretObject): string | undefined {
+  const owner = managedBy(secret)
+  if (owner === undefined) return undefined
+  return `${where(t)} is managed by ${owner}, which would write its own value back on its next sync. Change the value at its source instead.`
 }
 
 export async function writeKey($: Engine, e: Record<string, unknown>, source: Source) {
@@ -196,8 +218,22 @@ async function apply($: Engine, t: Target, key: string, before: SecretObject, va
   const after = await readSecret($, t)
   if (typeof after === 'string') return { deny: `written, but reading it back failed: ${after}` }
   const verified = after.data?.[key] === btoa(value)
-  const report = { ...t, key, written: true, verified, ...(await summary(after)) }
+  const report = { ...t, key, written: true, verified, ...(await summary(after)), next: RESTART }
   return { result: JSON.stringify(report, null, 2) }
+}
+
+const RESTART =
+  'Running pods keep the old value: one read as an environment variable until the pod restarts, a mounted file until the kubelet syncs it. ' +
+  'Restart the workloads that use this key, and change the value wherever else it is checked (a database password, a peer service).'
+
+// What would write this Secret back over a change made here: a controller
+// that owns it (ExternalSecret, SealedSecret, an operator) or External
+// Secrets' merge mode, which owns no Secret but marks it.
+export function managedBy(secret: SecretObject): string | undefined {
+  const owner = secret.metadata?.ownerReferences?.find(o => o.controller)
+  if (owner !== undefined) return `${owner.kind} ${owner.name}`
+  const marks = Object.keys({ ...secret.metadata?.annotations, ...secret.metadata?.labels })
+  return marks.some(k => k.startsWith('reconcile.external-secrets.io/')) ? 'External Secrets' : undefined
 }
 
 export function rotate($: Engine, e: Record<string, unknown>) {
@@ -231,19 +267,29 @@ export async function startPaste($: Engine, e: Record<string, unknown>): Promise
   return { label: `${p.key} in Secret ${where(p.t)}` }
 }
 
-// The pasted value (one trailing newline dropped), or undefined for a cancel:
-// what to tell Claude, which never carries the value.
-export async function finishPaste($: Engine, pasted: string | undefined): Promise<string | undefined> {
+// The pasted value (one trailing newline dropped), or undefined for a cancel.
+// Answers what to tell Claude, which never carries the value, and the call it
+// ends, for the audit log.
+export async function finishPaste(
+  $: Engine,
+  pasted: string | undefined,
+): Promise<{ text: string; written: boolean; call: Record<string, unknown> } | undefined> {
   const p = pasting
   if (p === null) return undefined
   pasting = null
-  if (pasted === undefined) return `the person cancelled secret_set for ${p.key}`
+  const call = { ...p.t, key: p.key }
+  const failed = (why: string) => ({ text: `secret_set for ${p.key} failed: ${why}`, written: false, call })
+  if (pasted === undefined) return { text: `the person cancelled secret_set for ${p.key}`, written: false, call }
   const value = pasted.replace(/\r?\n$/, '')
   track(value)
   const before = await readSecret($, p.t)
-  if (typeof before === 'string') return `secret_set for ${p.key} failed: ${before}`
+  if (typeof before === 'string') return failed(before)
+  // A controller may have taken the Secret over while the field was open.
+  const owned = refuseManaged(p.t, before)
+  if (owned !== undefined) return failed(owned)
   const r = await apply($, p.t, p.key, before, value)
-  return 'deny' in r ? `secret_set for ${p.key} failed: ${r.deny}` : `secret_set wrote ${p.key}: ${r.result}`
+  if ('deny' in r && r.deny !== undefined) return failed(r.deny)
+  return { text: `secret_set wrote ${p.key}: ${r.result}`, written: true, call }
 }
 
 // Answers file names only: the values travel to grep on stdin.
@@ -254,13 +300,29 @@ export async function leakCheck($: Engine, e: Record<string, unknown>) {
     Array.isArray(given) && given.length > 0 && given.every(p => typeof p === 'string' && p.startsWith('/'))
       ? (given as string[])
       : [`${await $.env.get('HOME')}/.claude`]
+  const patterns = leakPatterns()
+  if (patterns.length === 0) return { result: 'nothing to look for: every value this load holds is too short to search for' }
   const ran = await $.process.run(['grep', '-rlsF', '-f', '-', '--', ...paths], {
-    stdin: `${[...known].join('\n')}\n`,
+    stdin: `${patterns.join('\n')}\n`,
     timeoutMs: 120_000,
   })
   if (ran.exitCode > 1 && ran.stdout === '') return { deny: `grep failed with exit code ${ran.exitCode}` }
   const files = ran.stdout.split('\n').filter(Boolean)
   return { result: JSON.stringify({ searched: paths, valuesLookedFor: known.size, filesHoldingOne: files, partial: ran.exitCode > 1 }, null, 2) }
+}
+
+// grep -F takes one pattern a line, and an empty one matches every line: a
+// multi-line value (a PEM) is looked for line by line, leaving out empty
+// lines, short ones and PEM armor, which any certificate file holds.
+export function leakPatterns(values: Iterable<string> = known): string[] {
+  const out = new Set<string>()
+  for (const value of values) {
+    for (const raw of value.split('\n')) {
+      const line = raw.replace(/\r$/, '')
+      if (line.length >= MIN_TRACKED && !/^-----(BEGIN|END) [A-Z0-9 ]+-----$/.test(line)) out.add(line)
+    }
+  }
+  return [...out]
 }
 
 const DATA_OUTPUT = /^(yaml|json|jsonpath|go-template|template|custom-columns)/
@@ -272,23 +334,44 @@ function outputFormat(call: Call): string | undefined {
     if (a.startsWith('--output=')) return a.slice('--output='.length)
     if (a.startsWith('-o')) return a.slice(2).replace(/^=/, '')
   }
-  return undefined
+  // kubectl reads a lone --template as -o go-template.
+  return call.args.some(a => a === '--template' || a.startsWith('--template=')) ? 'go-template' : undefined
 }
 
+// In a command run inside a container: printing its environment, a variable
+// named like a credential, or a file under a path named for secrets.
+const EXEC_PRINTS = [
+  /(^|\s)(env|printenv)(\s|$)|\/environ\b/,
+  /\$\{?[A-Za-z0-9_]*(PASS|TOKEN|SECRET|KEY|DSN|CREDENTIAL|AUTH)[A-Za-z0-9_]*/i,
+  /\b(cat|head|tail|less|more|base64|xxd|od|strings)\b[^|;&]*secret/i,
+]
+
+export type ReadOptions = { allowHelmGet?: boolean }
+
 // Why a call would print Secret data, if it would. Best effort: the real
-// wall is a kube identity without `get secrets`.
-export function readsSecret(call: Call): string | undefined {
+// wall is an identity without read access to secrets.
+export function readsSecret(call: Call, options: ReadOptions = {}): string | undefined {
   const p = positionals(call)
   if (call.tool === 'helm') {
+    if (options.allowHelmGet) return undefined
     return p[0] === 'get' && ['all', 'manifest', 'values'].includes(p[1] ?? '') ? 'it would print rendered Secrets or chart values' : undefined
   }
+  if (call.tool === 'gcloud') {
+    return p.includes('secrets') && p.includes('versions') && p.includes('access') ? 'it would print a Secret Manager value' : undefined
+  }
+  if (call.tool === 'aws') {
+    if (p[0] === 'secretsmanager' && p[1] === 'get-secret-value') return 'it would print a Secrets Manager value'
+    if (p[0] === 'ssm' && /^get-parameters?(-by-path)?$/.test(p[1] ?? '') && call.args.includes('--with-decryption')) return 'it would print a decrypted SSM parameter'
+    return undefined
+  }
   if (call.tool !== 'kubectl') return undefined
-  const namesSecret = (p[1] ?? '').split(',').some(r => /^secrets?(\/.*)?$/.test(r))
+  const namesSecret = (p[1] ?? '').split(',').some(r => /^secrets?(\.v1)?(\/.*)?$/.test(r))
   if (p[0] === 'get' && namesSecret && DATA_OUTPUT.test(outputFormat(call) ?? '')) return 'it would print Secret data'
   if (call.args.includes('--raw') && call.args.some(a => a.includes('/secrets'))) return 'it would print Secret data through the raw API'
   if (p[0] === 'edit' && namesSecret) return 'it would open Secret data in an editor'
-  if (p[0] === 'exec' && /(^|\s)(env|printenv)(\s|$)|\/environ\b/.test(call.text)) {
-    return "it would print a container's environment, which Secrets feed"
+  if (p[0] === 'exec') {
+    const inside = call.args.slice(call.args.indexOf('--') + 1).join(' ')
+    if (EXEC_PRINTS.some(r => r.test(inside))) return "it would print a container's credentials (its environment or a secret file)"
   }
   return undefined
 }
