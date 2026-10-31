@@ -1,6 +1,6 @@
 {
   "name": "infra-guard",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Guards infra work from Claude Code: shows the ambient kube/gcloud/gh/aws/argocd targets, requires named contexts and approved terraform/OpenTofu/terragrunt plans, reads scripts before they run, keeps Secret values from the model, logs changes and watches rollouts.",
   "author": {
     "name": "Jerry Chuang",

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AuditEntry } from '../types'
 import { settle, shown } from '../hooks/approval'
 import { mask, timeline } from '../hooks/audit'
@@ -365,6 +365,20 @@ describe('the Bash hook', () => {
     expect(helmfile).toContain('sets kubeContext itself')
     expect(refused(await $.tool.call({ tool: 'Bash', command: 'kubecolor delete pod x' }))).toContain('kubectl --context')
     expect(ran.length).toBe(0)
+  })
+
+  test('when its own check fails, runs a line that names no infra CLI or script, and refuses one that does', async ($, on) => {
+    const ran: string[] = []
+    mock.env(on, { HOME })
+    on('session.cwd', () => ({ deny: 'no cwd' }))
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: 'ok', stderr: '', interrupted: false } }
+    })
+    expect(refused(await $.tool.call({ tool: 'Bash', command: 'git status' }))).toBeUndefined()
+    expect(refused(await $.tool.call({ tool: 'Bash', command: 'kubectl --context dev get pods' }))).toContain('its check failed')
+    expect(refused(await $.tool.call({ tool: 'Bash', command: 'bash deploy.sh' }))).toContain('its check failed')
+    expect(ran).toEqual(['git status'])
   })
 
   test('lets a heredoc that writes a deploy script through', async ($, on) => {

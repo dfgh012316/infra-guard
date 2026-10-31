@@ -29,6 +29,6 @@ export type PendingPaste = { label: string; inPane: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
-    'infra-guard': { targets: Targets | null; watches: Watch[]; pending: PendingPaste | null }
+    'infra-guard': { targets: Targets | null; watches: Watch[]; pending: PendingPaste | null; scrubSkipped: boolean }
   }
 }

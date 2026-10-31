@@ -9,6 +9,13 @@ export type ScriptRun = { path: string; cwd: string }
 const TOOLS = new Set<string>(['kubectl', 'helm', 'helmfile', 'gcloud', 'aws', 'terraform', 'tofu', 'terragrunt', 'gh', 'argocd', 'kubectx', 'kubens'])
 // Drop-in replacements, read as the tool they stand in for.
 const STANDS_FOR: Record<string, Tool> = { kubecolor: 'kubectl' }
+const MENTIONS = new RegExp(`\\b(${[...TOOLS, ...Object.keys(STANDS_FOR)].join('|')})\\b|\\.(sh|bash)\\b`)
+
+// Whether a line could run an infra CLI or a script, by its spelling alone:
+// what the command check falls back on when reading the line failed.
+export function mentionsInfra(line: string): boolean {
+  return MENTIONS.test(line)
+}
 // Words that open a command without being it.
 const KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{'])
 // Commands that run the command after them, with the flags that take a value

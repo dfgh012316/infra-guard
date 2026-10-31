@@ -24,7 +24,7 @@ import {
   startPaste,
   type ReadOptions,
 } from './secrets'
-import { calls, isWrite, namesTarget, scriptRuns, switchesTarget, type Call } from './shell'
+import { calls, isWrite, mentionsInfra, namesTarget, scriptRuns, switchesTarget, type Call } from './shell'
 import { prodTargets, readTargets } from './targets'
 import { describePlan, summarizePlan, terraformRuns } from './terraform'
 import { ghRunProgress, rolloutProgress } from './watch'
@@ -68,6 +68,15 @@ const HELMFILE_NOTE = ' If the helmfile sets kubeContext itself, pass that same 
 const targets = atom({ plugin: 'infra-guard', key: 'targets' } as const, null as Targets | null)
 const watches = atom({ plugin: 'infra-guard', key: 'watches' } as const, [] as Watch[])
 const pending = atom({ plugin: 'infra-guard', key: 'pending' } as const, null as PendingPaste | null)
+// Whether a plugin above this one sends stored rows on past it (README): set
+// when a turn starts after tool calls none of whose result rows came by, as
+// each is stored before the next turn starts.
+const scrubSkipped = atom({ plugin: 'infra-guard', key: 'scrubSkipped' } as const, false as boolean)
+let toolCalls = 0
+let resultRows = 0
+const LEAK_NOTE =
+  `${PLUGIN}: another plugin sends stored rows on past this one, so this session's transcript is not scrubbed; ` +
+  'offer the person leak_check once the Secret work is done'
 // The pane secret_set opens for the person to paste a value into.
 const PASTE = 'secret-paste'
 
@@ -351,7 +360,8 @@ async function endPaste($: Engine, pasted: string | undefined, closePane: boolea
   if (ended === undefined) return
   const r = ended.written ? { result: ended.text } : { deny: ended.text }
   await recordSecretWrite($, 'secret_set', ended.call, r, started).catch(() => undefined)
-  await $.prompt.submit({ text: `${PLUGIN}: ${ended.text}` })
+  const note = ended.written && (await read($, scrubSkipped)) ? `\n${LEAK_NOTE}` : ''
+  await $.prompt.submit({ text: `${PLUGIN}: ${ended.text}${note}` })
 }
 
 // The field itself, in the pane or the band. No `value` prop: the text stays in
@@ -430,6 +440,12 @@ async function guarded<R extends Ran & { isError?: true; context?: readonly stri
   if (line === announced) return answered
   announced = line
   return { ...answered, context: [...(answered.context ?? []), `${PLUGIN}: ambient targets now: ${line}`] }
+}
+
+// A Secret write in a session whose rows go unscrubbed tells Claude so.
+async function noted<R extends { deny?: string; result?: unknown; context?: readonly string[] }>($: Engine, r: R) {
+  if (r.deny !== undefined || !(await read($, scrubSkipped))) return r
+  return { ...r, context: [...(r.context ?? []), LEAK_NOTE] }
 }
 
 // A call the person approved in a dialog here runs on that answer: an ask
@@ -553,6 +569,7 @@ export const register: Register = (on, options) => {
       await update($, pending, () => null)
       await $.ui.close({ id: PASTE })
     }
+    await update($, scrubSkipped, () => false)
     let ticks = 0
     $.clock.every(TICK_MS, () => void tick($, ++ticks % 3 === 0))
     return next(e)
@@ -574,7 +591,7 @@ export const register: Register = (on, options) => {
     const started = await $.clock.now()
     const r = await rotate($, e as Record<string, unknown>)
     await recordSecretWrite($, 'secret_rotate', e as Record<string, unknown>, r, started).catch(() => undefined)
-    return r
+    return noted($, r)
   }).catch(() => ({
     deny: `${PLUGIN}: the rotation failed before it reported`,
   }))
@@ -584,7 +601,7 @@ export const register: Register = (on, options) => {
     // An opened field is logged when the paste ends (endPaste); a refusal now.
     const r = input.file === undefined ? await openPaste($, input) : await setFromFile($, input)
     if (input.file !== undefined || 'deny' in r) await recordSecretWrite($, 'secret_set', input, r, started).catch(() => undefined)
-    return r
+    return input.file === undefined ? r : noted($, r)
   }).catch(() => ({
     deny: `${PLUGIN}: setting the value failed before it reported`,
   }))
@@ -602,29 +619,44 @@ export const register: Register = (on, options) => {
   })
 
   const checkFailed = `${PLUGIN}: its check failed, so the command was refused`
+  // A check that failed before the command ran refuses it only when the line
+  // could run an infra CLI or a script; any other runs, its output still checked.
   on('tool.call', { tool: 'Bash' }, ($, e, next) => guarded($, e.command, e.tool_use_id, () => next(e), reads, prod)).catch(async ($, e, next) =>
-    next.called ? withheld(await next(e)) : { deny: checkFailed },
+    next.called || !mentionsInfra(e.command) ? withheld(await next(e)) : { deny: checkFailed },
   )
   // A Monitor runs its command in the same shell as Bash; one that opens a
   // WebSocket runs none. Its events reach Claude as notifications (below).
   on('tool.call', { tool: 'Monitor' }, ($, e, next) =>
     e.command === undefined ? next(e) : guarded($, e.command, e.tool_use_id, () => next(e), reads, prod),
-  ).catch(async ($, e, next) => (next.called ? withheld(await next(e)) : { deny: checkFailed }))
+  ).catch(async ($, e, next) =>
+    next.called || e.command === undefined || !mentionsInfra(e.command) ? withheld(await next(e)) : { deny: checkFailed },
+  )
 
   on('tool.check', { tool: 'Bash' }, async ($, e, next) => allowApproved($, e.tool_use_id, await next(e)))
   on('tool.check', { tool: 'Monitor' }, async ($, e, next) => allowApproved($, e.tool_use_id, await next(e)))
 
   // Every other tool: output carrying a known value never reaches the model.
-  on('tool.call', async ($, e, next) => (e.tool === 'Bash' ? next(e) : withheld(await next(e)))).catch(() => ({
+  on('tool.call', async ($, e, next) => {
+    toolCalls++
+    return e.tool === 'Bash' ? next(e) : withheld(await next(e))
+  }).catch(() => ({
     deny: `${PLUGIN}: its output check failed, so the output was withheld`,
   }))
 
+  // Each prompt submitted. One that starts a turn after tool calls none of
+  // whose result rows came by says the scrub below is not running; a failure
+  // in that judgment holds no prompt.
   // A background task's notification (a Monitor's events, a background
   // command's end) carrying a known value never reaches the model. Dropped
   // whole, not rewritten: the engine documents no rewrite of a notification
   // that starts a turn. Claude hears that one was,
   // from a dispatch of its own: a submit inside this hook would wait on itself.
   on('prompt.submit', async ($, e, next) => {
+    try {
+      if (e.turnId === undefined && toolCalls > 0 && resultRows === 0 && !(await read($, scrubSkipped))) await update($, scrubSkipped, () => true)
+    } catch {
+      // Judged again at the next turn.
+    }
     if (e.origin?.kind !== 'task-notification' || !hasKnown() || !carriesKnown(e.text)) return next(e)
     $.clock.after(0, () => void $.prompt.submit({ text: `${PLUGIN}: a background task's notification carried a Secret value this guard manages, so it was withheld` }))
     return { drop: `${PLUGIN}: withheld a background task's notification that carried a Secret value` }
@@ -632,6 +664,7 @@ export const register: Register = (on, options) => {
 
   // Every stored row: a known value is replaced before it is kept or sent.
   on('session.append', ($, e, next) => {
+    if (e.door === 'tool-result') resultRows++
     if (!hasKnown() || !carriesKnown(JSON.stringify(e.message.content))) return next(e)
     const content = e.message.content.map(block => {
       if (block.type === 'text' && typeof block.text === 'string') return { ...block, text: scrub(block.text) }
@@ -666,6 +699,7 @@ export const register: Register = (on, options) => {
     const t = await read($, targets)
     const all = await read($, watches)
     const paste = await read($, pending)
+    const skipped = await read($, scrubSkipped)
     const shown = [...all.filter(w => w.state === 'running'), ...all.filter(w => w.state !== 'running').slice(-FINISHED_SHOWN)]
     const { Box, Text } = $.ui.resolve(e)
     const part = (key: string, label: string, value: string | undefined) => {
@@ -691,6 +725,11 @@ export const register: Register = (on, options) => {
             {`${w.state === 'running' ? 'watching' : w.state} ${w.label}: ${w.status}`}
           </Text>
         ))}
+        {skipped && (
+          <Text key="scrub-off" color="warning">
+            {`${PLUGIN}: transcript scrub is off, another plugin sends stored rows past this one. Run leak_check after Secret work.`}
+          </Text>
+        )}
         {paste !== null && !paste.inPane && pasteField($, e, paste, ' ctrl+x tab reaches the field.')}
       </Box>
     )

@@ -378,3 +378,45 @@ test('drops a background task notification carrying a known value, and tells Cla
   expect(told.some(t => t.includes(minted))).toBe(false)
   expect(told.some(t => t.includes('notification carried a Secret value'))).toBe(true)
 })
+
+test('says so in the band when stored rows pass it by, and asks Claude to offer leak_check after a write', async ($, on) => {
+  let stored: Record<string, string> = {}
+  engine(on, { answer: 'Rotate' })
+  on('process.run', ($, e) => {
+    if (e.argv[5] === 'get') return exited(0, JSON.stringify({ type: 'Opaque', data: stored }))
+    if (e.argv[5] === 'replace') {
+      stored = (JSON.parse(e.init?.stdin ?? '{}') as { data: Record<string, string> }).data
+      return exited(0, 'secret/app replaced')
+    }
+    return exited(1, '', 'unexpected')
+  })
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const ui = await $.ui.mount({ plugin: 'infra-guard', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ text: /transcript scrub is off/ })).toBeUndefined()
+  await $.prompt.submit({ text: 'next', origin: { kind: 'composer' }, wait: false })
+  await ui.redraw(BAND)
+  expect(await ui.find({ text: /transcript scrub is off/ })).toBeDefined()
+
+  const r = await $.tool.call({ tool: ROTATE, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'TOKEN' })
+  expect(refused(r)).toBeUndefined()
+  expect(r.context?.join(' ')).toContain('leak_check')
+})
+
+test('says nothing while the result rows come by', async ($, on) => {
+  engine(on)
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  // The tool's result row, raised as the engine stores it; with a plugin above
+  // that sends rows on past infra-guard, none comes by.
+  await $.session.append({
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Bash' },
+    uuid: crypto.randomUUID(),
+    message: { type: 'user', role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
+  })
+  await $.prompt.submit({ text: 'next', origin: { kind: 'composer' }, wait: false })
+  const ui = await $.ui.mount({ plugin: 'infra-guard', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(await ui.find({ text: /transcript scrub is off/ })).toBeUndefined()
+})
+
