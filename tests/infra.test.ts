@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 import type { AuditEntry } from '../types'
 import { settle, shown } from '../hooks/approval'
 import { mask, timeline } from '../hooks/audit'
@@ -7,7 +7,8 @@ import { calls, isWrite, namesTarget, scriptRuns, scripts, switchesTarget } from
 import { ghActiveUser, iniValue } from '../hooks/targets'
 import { summarizePlan, terraformRuns } from '../hooks/terraform'
 import { ghRunProgress, rolloutProgress } from '../hooks/watch'
-import { engine, exited, HOME, refused } from './helpers'
+import type { On } from 'claude-code'
+import { BAND, engine, exited, HOME, PANE, refused } from './helpers'
 
 describe('reading command lines', () => {
   test('finds infra calls behind sudo, k3s, env and inside ssh quotes', () => {
@@ -418,3 +419,106 @@ describe('the Monitor tool', () => {
     expect(asked[0]).toContain('PRODUCTION')
   })
 })
+
+describe('the script review', () => {
+  const SCRIPT = '#!/usr/bin/env bash\nENV=$2\nhelm upgrade --install "$1" ./charts/$1 -f values-$ENV.yaml\n'
+  const RUN = { tool: 'Bash', command: './up.sh api sre' } as const
+
+  // The surface beneath: the ambient context, whether a pane is placed, and
+  // what Claude is told.
+  function surface(on: On) {
+    const s = { context: 'dev', placed: true as boolean | 'no-surface', opened: 0, closed: [] as string[], told: [] as string[] }
+    on('process.run', () => exited(0, `${s.context}\n`))
+    on('ui.open', () => {
+      s.opened++
+      return { value: s.placed === true ? { isPlaced: true } : { isPlaced: false, reason: s.placed === false ? 'unasked, 100 columns' : 'no-surface: a -p run' } }
+    })
+    on('ui.close', ($, e) => {
+      s.closed.push(e.id)
+      return { value: undefined }
+    })
+    on('prompt.submit', ($, e) => {
+      s.told.push(e.text)
+      return { text: e.text }
+    })
+    return s
+  }
+  const pane = ($: Engine) =>
+    $.ui.mount({ plugin: 'infra-guard', surface: 'terminal', component: 'Pane', requestId: 'script-review', props: PANE })
+
+  test('shows every script whole in a pane, and runs the call once the person approves it', async ($, on) => {
+    const { ran, asked, audit } = engine(on, { files: { '/w/up.sh': SCRIPT } })
+    const s = surface(on)
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing it in a pane')
+    expect(ran.length).toBe(0)
+    expect(asked.length).toBe(0)
+
+    const p = await pane($)
+    expect(await p.find({ text: /ENV=\$2/ })).toBeDefined()
+    expect(await p.find({ text: /▶ 3 {2}helm upgrade/ })).toBeDefined()
+    expect(await p.find({ text: /no explicit target/ })).toBeDefined()
+    // Each answer is drawn with the key that presses it.
+    expect((await p.find({ key: 'review-run' }))?.props).toMatchObject({ hotkey: 'r', plain: true })
+    expect((await p.find({ key: 'review-cancel' }))?.props).toMatchObject({ hotkey: 'c', plain: true })
+    await p.press({ key: 'review-run' })
+    expect(s.told.at(-1)).toContain('approved the run')
+    expect(s.closed).toContain('script-review')
+
+    expect(refused(await $.tool.call(RUN))).toBeUndefined()
+    expect(ran).toEqual([RUN.command])
+    expect(audit().at(-1)?.note).toContain('as the person reviewed them')
+    // Once: the next run is reviewed again.
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing')
+  })
+
+  test('asks again when the script or the target changed after the review', async ($, on) => {
+    const files: Record<string, string> = { '/w/up.sh': SCRIPT }
+    const { ran } = engine(on, { files })
+    const s = surface(on)
+    await $.tool.call(RUN)
+    const p = await pane($)
+    await p.press({ key: 'review-run' })
+    files['/w/up.sh'] = `${SCRIPT}kubectl delete namespace api\n`
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing')
+
+    await p.redraw(PANE)
+    expect(await p.find({ text: /kubectl delete namespace api/ })).toBeDefined()
+    await p.press({ key: 'review-run' })
+    s.context = 'prod-gke'
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing')
+    expect(ran.length).toBe(0)
+  })
+
+  test('Cancel refuses the run and tells Claude', async ($, on) => {
+    const { ran } = engine(on, { files: { '/w/up.sh': SCRIPT } })
+    const s = surface(on)
+    await $.tool.call(RUN)
+    await (await pane($)).press({ key: 'review-cancel' })
+    expect(s.told.at(-1)).toContain('did not run it')
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing')
+    expect(ran.length).toBe(0)
+  })
+
+  test('on a narrow terminal the band opens the review on the person\'s press', async ($, on) => {
+    engine(on, { files: { '/w/up.sh': SCRIPT } })
+    const s = surface(on)
+    s.placed = false
+    expect(refused(await $.tool.call(RUN))).toContain('from a row above the prompt')
+    expect(s.closed).toContain('script-review')
+
+    const band = await $.ui.mount({ plugin: 'infra-guard', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+    s.placed = true
+    await band.press({ key: 'review-open' })
+    expect(s.opened).toBe(2)
+    expect(await (await pane($)).find({ text: /helm upgrade/ })).toBeDefined()
+  })
+
+  test('with no surface to draw on, the dialog asks as before', async ($, on) => {
+    const { asked } = engine(on, { files: { '/w/up.sh': SCRIPT } })
+    const s = surface(on)
+    s.placed = 'no-surface'
+    expect(refused(await $.tool.call(RUN))).toContain('the person did not run it')
+    expect(asked.length).toBe(1)
+  })
+})
+

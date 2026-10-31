@@ -37,7 +37,7 @@ export function scanScript(file: string, text: string, home: string, cwd: string
   return { findings, nested }
 }
 
-const WHY = {
+export const WHY = {
   ambient: 'no explicit target',
   switches: 'switches the ambient target',
   terraform: 'terraform change the plan gate cannot see inside a script',

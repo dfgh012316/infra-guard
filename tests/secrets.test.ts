@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import { leakPatterns, managedBy } from '../hooks/secrets'
-import { engine, exited, refused } from './helpers'
+import { BAND, engine, exited, PANE, refused } from './helpers'
 
 const ROTATE = 'mcp__infra-guard__secret_rotate'
 const SET = 'mcp__infra-guard__secret_set'
@@ -230,8 +230,6 @@ test('secret_set needs an absolute path to a readable, non-empty file', async ($
 })
 
 // The paste field: a pane where one is placed, else the band above the prompt.
-const PANE = { title: 'infra-guard', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 5 }, view: {} } as const
-const BAND = { hasSurvey: false, isWorking: true, maxRows: 12, bodyColumns: 80, scroll: { offset: 0, bodyRows: 12 }, view: {} } as const
 const TARGET = { tool: SET, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'VENDOR' } as const
 
 // A cluster of one Secret, the pane's placement, and what reaches Claude.

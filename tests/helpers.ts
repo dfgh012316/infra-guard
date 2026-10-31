@@ -3,6 +3,9 @@ import type { On } from 'claude-code'
 import type { AuditEntry } from '../types'
 
 export const HOME = '/home/u'
+// Props a surface draws a pane and the band with.
+export const PANE = { title: 'infra-guard', isFocused: true, bodyColumns: 80, placement: 'inline', scroll: { offset: 0, bodyRows: 5 }, view: {} } as const
+export const BAND = { hasSurvey: false, isWorking: true, maxRows: 12, bodyColumns: 80, scroll: { offset: 0, bodyRows: 12 }, view: {} } as const
 
 export function exited(exitCode: number, stdout: string, stderr = '') {
   return { value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }

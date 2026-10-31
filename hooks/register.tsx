@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
-import type { AuditEntry, PendingPaste, Targets, Watch } from '../types'
+import type { AuditEntry, PendingPaste, PendingReview, Targets, Watch } from '../types'
 import { settle, shown } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
-import { describeFindings, scanScript, type Finding } from './script'
+import { describeFindings, scanScript, WHY, type Finding } from './script'
 import {
   carriesKnown,
   carriesKnownIn,
@@ -79,6 +79,17 @@ const LEAK_NOTE =
   'offer the person leak_check once the Secret work is done'
 // The pane secret_set opens for the person to paste a value into.
 const PASTE = 'secret-paste'
+// The pane a script run waits in for the person's review, and what it draws.
+const REVIEW = 'script-review'
+const review = atom({ plugin: 'infra-guard', key: 'review' } as const, null as PendingReview | null)
+// Lines of one script the review draws; past them it says how many more.
+const REVIEW_LINES = 2000
+// A script run as the person reads it in the review: the call, the targets of
+// the moment and every script's text. `reviewing` is the one open now;
+// `approval` the one they approved, which runs once, unchanged, on Claude's next try.
+type Run = { command: string; cwd: string; ambient: string; scripts: [string, string][]; unread: string[] }
+let reviewing: Run | null = null
+let approval: Run | null = null
 
 // What Claude was last told of the targets: it hears again only on a change.
 let announced = ''
@@ -164,11 +175,15 @@ async function terraformGate($: Engine, command: string, w: Where, line: Shown):
 
 // Reads each script the line runs (and those it runs, two levels down), each
 // from the directory it runs in.
-async function scriptGate($: Engine, command: string, w: Where, t: Targets | null, prod: RegExp, line: Shown): Promise<Gate> {
+async function scriptGate($: Engine, command: string, w: Where, prod: RegExp, line: Shown): Promise<Gate> {
   const queue = scriptRuns(command, w.cwd, w.home).map(run => ({ ...run, depth: 0 }))
   const seen = new Set<string>()
   const findings: Finding[] = []
   const unread: string[] = []
+  const texts: [string, string][] = []
+  // An approval stands for Claude's next script run alone, and only unchanged.
+  const approved = approval
+  approval = null
   while (queue.length > 0) {
     const { path, cwd, depth } = queue.shift()!
     if (seen.has(path)) continue
@@ -180,12 +195,21 @@ async function scriptGate($: Engine, command: string, w: Where, t: Targets | nul
       unread.push(path)
       continue
     }
+    texts.push([path, text])
     const scan = scanScript(path, text, w.home, cwd)
     findings.push(...scan.findings)
     if (depth < 2) queue.push(...scan.nested.map(run => ({ ...run, depth: depth + 1 })))
   }
   if (findings.length === 0 && unread.length === 0) return {}
+  // Read now: the run binds the targets it would take.
+  const t = await refresh($)
   const onProd = prodTargets(t, prod)
+  const run: Run = { command, cwd: w.cwd, ambient: targetLine(t), scripts: texts, unread }
+  if (approved !== null && JSON.stringify(approved) === JSON.stringify(run)) {
+    return { confirmed: `${findings.length} ambient command(s) in scripts, run as the person reviewed them` }
+  }
+  const reviewed = await openReview($, run, findings, onProd, line, w.home)
+  if (reviewed !== undefined) return { deny: reviewed }
   const question = [
     `${seen.size} script(s) would run ${findings.length} command(s) that take the ambient target:`,
     ...describeFindings(findings, w.home),
@@ -202,6 +226,118 @@ async function scriptGate($: Engine, command: string, w: Where, t: Targets | nul
     }
   }
   return { confirmed: `${findings.length} ambient command(s) in scripts, run as asked` }
+}
+
+// Opens the review of a script run, where the person reads every script whole
+// and runs or cancels it: a pane, or, where none is placed unasked (a narrow
+// terminal), a band row that opens one. Answers the refusal that tells Claude
+// to wait, or undefined where nothing can draw it (the dialog asks instead).
+async function openReview($: Engine, run: Run, findings: Finding[], onProd: string[], line: Shown, home: string): Promise<string | undefined> {
+  if (reviewing !== null) return `${PLUGIN}: another script run is waiting for the person's review; run this one once they have decided`
+  const scripts = run.scripts.map(([path, text]) => {
+    const lines = scrub(text).replace(/\t/g, '  ').split('\n')
+    if (lines.at(-1) === '') lines.pop()
+    const flagged = findings.filter(f => f.file === path).map(f => ({ line: f.line, why: WHY[f.why] }))
+    return { path: short(path, home), lines: lines.slice(0, REVIEW_LINES), flagged, more: Math.max(lines.length - REVIEW_LINES, 0) }
+  })
+  const shown: PendingReview = {
+    command: line.text,
+    cwd: short(run.cwd, home),
+    ambient: run.ambient,
+    production: onProd,
+    scripts,
+    unread: run.unread.map(p => short(p, home)),
+    inPane: true,
+  }
+  await update($, review, () => shown)
+  reviewing = run
+  const opened = await $.ui
+    .open({ id: REVIEW, title: `${PLUGIN}: review before it runs`, focus: true, closeOnEscape: true, holdToasts: true })
+    .catch(() => undefined)
+  if (opened === undefined || (!opened.isPlaced && opened.reason.startsWith('no-surface'))) {
+    reviewing = null
+    await update($, review, () => null)
+    if (opened !== undefined) await $.ui.close({ id: REVIEW })
+    return undefined
+  }
+  if (!opened.isPlaced) {
+    // A pane waiting undrawn would pop up later; the band's button opens it now.
+    await $.ui.close({ id: REVIEW })
+    await update($, review, r => r && { ...r, inPane: false })
+  }
+  const names = scripts.map(s => s.path).join(', ')
+  return (
+    `${PLUGIN}: ${names} would run ${findings.length} command(s) that take the ambient target, so the person is reviewing ` +
+    `${opened.isPlaced ? 'it in a pane' : 'it from a row above the prompt'} before it runs. A message arrives when they decide: ` +
+    'do not run it again, poll or wait for it before then.'
+  )
+}
+
+// The review pane, opened by the person from the band: placed at any width.
+async function showReview($: Engine) {
+  const opened = await $.ui.open({ id: REVIEW, title: `${PLUGIN}: review before it runs`, focus: true, closeOnEscape: true, holdToasts: true })
+  if (opened.isPlaced) await update($, review, r => r && { ...r, inPane: true })
+}
+
+// The person's answer: Run approves that very run once, for Claude to run
+// again; Cancel or Esc refuses it. Claude hears either way.
+async function endReview($: Engine, approved: boolean, closePane: boolean) {
+  const run = reviewing
+  if (run === null) return
+  reviewing = null
+  const shown = await read($, review)
+  await update($, review, () => null)
+  if (closePane) await $.ui.close({ id: REVIEW })
+  if (approved) approval = run
+  const names = shown?.scripts.map(s => s.path).join(', ') || 'the script'
+  await $.prompt.submit({
+    text: approved
+      ? `${PLUGIN}: the person reviewed ${names} and approved the run. Run the same command again now, unchanged, from ${shown?.cwd ?? run.cwd}.`
+      : `${PLUGIN}: the person reviewed ${names} and did not run it. Pass the target explicitly (kubectl --context, helm --kube-context, ` +
+        'gcloud --project, aws --profile), or ask them what to change.',
+  })
+}
+
+// The review itself: the call and its targets, the two answers, then every
+// script whole with its line numbers, each flagged line marked with why.
+function reviewBody($: Engine, e: Parameters<Engine['ui']['resolve']>[0], r: PendingReview) {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const prod = r.production.length > 0
+  const width = String(Math.max(...r.scripts.map(s => s.lines.length), 1)).length
+  const rows = r.scripts.flatMap(s => [
+    <Text key={`${s.path}:head`}> </Text>,
+    <Text key={`${s.path}:name`} bold>{`${s.path}  (${s.lines.length + s.more} lines, ${s.flagged.length} flagged)`}</Text>,
+    ...s.lines.flatMap((text, i) => {
+      const n = i + 1
+      const why = s.flagged.filter(f => f.line === n).map(f => f.why)
+      const number = String(n).padStart(width)
+      if (why.length === 0) return [<Text key={`${s.path}:${n}`}>{`  ${number}  ${text}`}</Text>]
+      return [
+        <Text key={`${s.path}:${n}`} color="error" bold>{`▶ ${number}  ${text}`}</Text>,
+        <Text key={`${s.path}:${n}:why`} color="warning">{`  ${' '.repeat(width)}  └ ${[...new Set(why)].join('; ')}`}</Text>,
+      ]
+    }),
+    ...(s.more > 0 ? [<Text key={`${s.path}:more`} dimColor>{`  … ${s.more} more lines not shown`}</Text>] : []),
+  ])
+  return (
+    <Box flexDirection="column">
+      <Text bold>{`$ ${r.command}`}</Text>
+      <Text dimColor>{`in ${r.cwd}`}</Text>
+      <Text color={prod ? 'error' : undefined} bold={prod}>
+        {`ambient: ${r.ambient}${prod ? `  PRODUCTION: ${r.production.join(', ')}` : ''}`}
+      </Text>
+      {/* plain: each answer drawn with its key, `r: Run it   c: Cancel`. */}
+      <Box flexDirection="row" columnGap={3}>
+        <Button key="review-run" label={prod ? 'Run against production' : 'Run it'} hotkey="r" plain onPress={() => endReview($, true, true)} />
+        <Button key="review-cancel" label="Cancel" hotkey="c" plain onPress={() => endReview($, false, true)} />
+      </Box>
+      <Text dimColor>↑↓ scroll · Esc cancels too</Text>
+      {r.unread.map(p => (
+        <Text key={`unread:${p}`} color="warning">{`could not read ${p}: it runs unseen`}</Text>
+      ))}
+      {rows}
+    </Box>
+  )
 }
 
 async function record($: Engine, entry: AuditEntry) {
@@ -402,7 +538,7 @@ async function guarded<R extends Ran & { isError?: true; context?: readonly stri
   let gate = directGate(found, before, reads)
   if (gate.deny === undefined) gate = await terraformGate($, command, w, asShown)
   if (gate.deny === undefined && runs.length > 0) {
-    const scripted = await scriptGate($, command, w, before, prod, asShown)
+    const scripted = await scriptGate($, command, w, prod, asShown)
     gate = { deny: scripted.deny, confirmed: [gate.confirmed, scripted.confirmed].filter(Boolean).join('; ') || undefined }
   }
   // Approved in a dialog that showed the whole line, the call is not asked
@@ -570,6 +706,11 @@ export const register: Register = (on, options) => {
       await $.ui.close({ id: PASTE })
     }
     await update($, scrubSkipped, () => false)
+    // A reload forgets the run under review and any approval; its pane goes too.
+    if ((await read($, review)) !== null) {
+      await update($, review, () => null)
+      await $.ui.close({ id: REVIEW })
+    }
     let ticks = 0
     $.clock.every(TICK_MS, () => void tick($, ++ticks % 3 === 0))
     return next(e)
@@ -685,6 +826,7 @@ export const register: Register = (on, options) => {
   // The person closing the paste pane (Esc, its close mark) cancels the paste.
   on('ui.close', async ($, e, next) => {
     if (e.id === PASTE && e.origin.kind === 'person') await endPaste($, undefined, false)
+    if (e.id === REVIEW && e.origin.kind === 'person') await endReview($, false, false)
     return next(e)
   })
 
@@ -694,14 +836,21 @@ export const register: Register = (on, options) => {
     return p === null ? <Text dimColor>Nothing is waiting to be pasted.</Text> : pasteField($, e, p, ' Esc cancels.')
   })
 
+  on('ui.render', { component: 'Pane', requestId: REVIEW }, async ($, e) => {
+    const r = await read($, review)
+    const { Text } = $.ui.resolve(e)
+    return r === null ? <Text dimColor>Nothing is waiting for review.</Text> : reviewBody($, e, r)
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const t = await read($, targets)
     const all = await read($, watches)
     const paste = await read($, pending)
     const skipped = await read($, scrubSkipped)
+    const waiting = await read($, review)
     const shown = [...all.filter(w => w.state === 'running'), ...all.filter(w => w.state !== 'running').slice(-FINISHED_SHOWN)]
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const part = (key: string, label: string, value: string | undefined) => {
       if (value === undefined) return null
       const isProd = prod.test(value)
@@ -731,6 +880,13 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {paste !== null && !paste.inPane && pasteField($, e, paste, ' ctrl+x tab reaches the field.')}
+        {waiting !== null && !waiting.inPane && (
+          <Box key="review" flexDirection="row">
+            <Text color="warning">{`${PLUGIN}: ${waiting.scripts.map(s => s.path).join(', ') || 'a script'} waits for your review (ctrl+x tab) `}</Text>
+            <Button key="review-open" label="Review" hotkey="v" variant="primary" onPress={() => showReview($)} />
+            <Button key="review-band-cancel" label="Cancel" onPress={() => endReview($, false, false)} />
+          </Box>
+        )}
       </Box>
     )
   })
