@@ -1,6 +1,6 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
-import type { AuditEntry, PendingPaste, PendingReview, Targets, Watch } from '../types'
+import type { AuditEntry, PendingPaste, PendingReview, ReviewScript, Targets, Watch } from '../types'
 import { settle, shown } from './approval'
 import { mask, targetLine, timeline } from './audit'
 import { CONTEXT, DNS_NAME, REPO } from './names'
@@ -251,9 +251,7 @@ async function openReview($: Engine, run: Run, findings: Finding[], onProd: stri
   }
   await update($, review, () => shown)
   reviewing = run
-  const opened = await $.ui
-    .open({ id: REVIEW, title: `${PLUGIN}: review before it runs`, focus: true, closeOnEscape: true, holdToasts: true })
-    .catch(() => undefined)
+  const opened = await $.ui.open(reviewPane(shown)).catch(() => undefined)
   if (opened === undefined || (!opened.isPlaced && opened.reason.startsWith('no-surface'))) {
     reviewing = null
     await update($, review, () => null)
@@ -275,8 +273,26 @@ async function openReview($: Engine, run: Run, findings: Finding[], onProd: stri
 
 // The review pane, opened by the person from the band: placed at any width.
 async function showReview($: Engine) {
-  const opened = await $.ui.open({ id: REVIEW, title: `${PLUGIN}: review before it runs`, focus: true, closeOnEscape: true, holdToasts: true })
-  if (opened.isPlaced) await update($, review, r => r && { ...r, inPane: true })
+  const r = await read($, review)
+  if (r === null) return
+  const opened = await $.ui.open(reviewPane(r))
+  if (opened.isPlaced) await update($, review, x => x && { ...x, inPane: true })
+}
+
+// The pane asks for the rows the review takes (reviewBody), and two more for
+// lines a narrow terminal wraps, so a short script shows whole, flagged lines
+// and their reasons included, without scrolling: a request the layout may
+// shrink, and a size the person set wins.
+function reviewPane(r: PendingReview) {
+  const rows =
+    7 + r.unread.length +
+    r.scripts.reduce((n, s) => n + 2 + s.lines.length + flaggedLines(s).filter(l => l <= s.lines.length).length + (s.more > 0 ? 1 : 0), 0)
+  return { id: REVIEW, title: `${PLUGIN}: review before it runs`, focus: true, closeOnEscape: true, holdToasts: true, rows } as const
+}
+
+// A script's flagged line numbers, each once.
+function flaggedLines(s: ReviewScript): number[] {
+  return [...new Set(s.flagged.map(f => f.line))].sort((a, b) => a - b)
 }
 
 // The person's answer: Run approves that very run once, for Claude to run
@@ -307,7 +323,7 @@ function reviewBody($: Engine, e: Parameters<Engine['ui']['resolve']>[0], r: Pen
   const width = String(Math.max(...r.scripts.map(s => s.lines.length), 1)).length
   const rows = r.scripts.flatMap(s => [
     <Text key={`${s.path}:head`}> </Text>,
-    <Text key={`${s.path}:name`} bold>{`${s.path}  (${s.lines.length + s.more} lines, ${s.flagged.length} flagged)`}</Text>,
+    <Text key={`${s.path}:name`} bold>{`${s.path}  (${s.lines.length + s.more} lines; flagged: ${flaggedLines(s).join(', ') || 'none'})`}</Text>,
     ...s.lines.flatMap((text, i) => {
       const n = i + 1
       const why = s.flagged.filter(f => f.line === n).map(f => f.why)
@@ -703,16 +719,26 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({ name: 'timeline', description: 'Infrastructure changes run from Claude Code, newest first', argumentHint: '[count]' })
     await refresh($)
-    // A reload forgets the paste it was waiting for; its field goes with it.
+    // A reload forgets the paste it was waiting for, the run under review and
+    // any approval; their fields and panes go with them, and Claude, told a
+    // message would come, hears that none will.
+    const closed: string[] = []
     if ((await read($, pending)) !== null) {
       await update($, pending, () => null)
       await $.ui.close({ id: PASTE })
+      closed.push('the paste of a Secret value')
     }
     await update($, scrubSkipped, () => false)
-    // A reload forgets the run under review and any approval; its pane goes too.
     if ((await read($, review)) !== null) {
       await update($, review, () => null)
       await $.ui.close({ id: REVIEW })
+      closed.push("a script run's review")
+    }
+    reviewing = null
+    approval = null
+    if (closed.length > 0) {
+      const text = `${PLUGIN} was reloaded, which closed ${closed.join(' and ')}: nothing ran and nothing was set. Start it again if it is still wanted.`
+      $.clock.after(0, () => void $.prompt.submit({ text }))
     }
     let ticks = 0
     $.clock.every(TICK_MS, () => void tick($, ++ticks % 3 === 0))

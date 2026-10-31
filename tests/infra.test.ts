@@ -100,7 +100,7 @@ describe('reading command lines', () => {
     expect(isWrite(one('argocd proj role create-token default ci'))).toBe(true)
     expect(isWrite(one('argocd app get sites-prod --grpc-web'))).toBe(false)
     expect(isWrite(one('argocd app diff sites-prod'))).toBe(false)
-    expect(namesTarget(one('argocd --argocd-context deploy.swag.example app sync x'))).toBe(true)
+    expect(namesTarget(one('argocd --argocd-context deploy.example.invalid app sync x'))).toBe(true)
     expect(namesTarget(one('ARGOCD_SERVER=cd.example argocd app sync x'))).toBe(true)
     expect(namesTarget(one('argocd --config /k app sync x'))).toBe(false)
     expect(switchesTarget(one('argocd context cd.example'))).toBe(true)
@@ -427,10 +427,11 @@ describe('the script review', () => {
   // The surface beneath: the ambient context, whether a pane is placed, and
   // what Claude is told.
   function surface(on: On) {
-    const s = { context: 'dev', placed: true as boolean | 'no-surface', opened: 0, closed: [] as string[], told: [] as string[] }
+    const s = { context: 'dev', placed: true as boolean | 'no-surface', opened: 0, rows: [] as (number | undefined)[], closed: [] as string[], told: [] as string[] }
     on('process.run', () => exited(0, `${s.context}\n`))
-    on('ui.open', () => {
+    on('ui.open', ($, e) => {
       s.opened++
+      s.rows.push(e.rows)
       return { value: s.placed === true ? { isPlaced: true } : { isPlaced: false, reason: s.placed === false ? 'unasked, 100 columns' : 'no-surface: a -p run' } }
     })
     on('ui.close', ($, e) => {
@@ -457,6 +458,11 @@ describe('the script review', () => {
     expect(await p.find({ text: /ENV=\$2/ })).toBeDefined()
     expect(await p.find({ text: /▶ 3 {2}helm upgrade/ })).toBeDefined()
     expect(await p.find({ text: /no explicit target/ })).toBeDefined()
+    expect(await p.find({ text: /up\.sh {2}\(3 lines; flagged: 3\)/ })).toBeDefined()
+    // Tall enough for the whole review: 5 rows of header, the script's name
+    // and the blank above it, its 3 lines and the flagged one's reason, and 2
+    // for wrapped lines.
+    expect(s.rows).toEqual([13])
     // Each answer is drawn with the key that presses it.
     expect((await p.find({ key: 'review-run' }))?.props).toMatchObject({ hotkey: 'r', plain: true })
     expect((await p.find({ key: 'review-cancel' }))?.props).toMatchObject({ hotkey: 'c', plain: true })
@@ -520,5 +526,21 @@ describe('the script review', () => {
     expect(refused(await $.tool.call(RUN))).toContain('the person did not run it')
     expect(asked.length).toBe(1)
   })
-})
 
+  test('a reload closes the review and tells Claude that nothing ran', async ($, on) => {
+    const { ran, clock } = engine(on, { files: { '/w/up.sh': SCRIPT } })
+    const s = surface(on)
+    // The engine's answers beneath what a reload raises.
+    on('tool.register', ($, e) => ({ value: { tool: `mcp__infra-guard__${e.name}` } }))
+    on('command.register', ($, e) => ({ value: { command: e.name } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing it in a pane')
+    await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true })
+    await clock.settle()
+    expect(s.closed).toContain('script-review')
+    expect(s.told.at(-1)).toContain("was reloaded, which closed a script run's review")
+    // The approval went with it: the next run is reviewed anew.
+    expect(refused(await $.tool.call(RUN))).toContain('reviewing it in a pane')
+    expect(ran.length).toBe(0)
+  })
+})
