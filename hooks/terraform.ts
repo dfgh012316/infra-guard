@@ -1,6 +1,6 @@
-import { calls, join, terraformWords, type Call } from './shell'
+import { calls, isTerraform, join, terraformWords, type Call } from './shell'
 
-export type TerraformRun = { tool: 'terraform' | 'terragrunt'; verb: 'apply' | 'destroy'; dir: string; plan?: string; isDestroy: boolean; isAll: boolean }
+export type TerraformRun = { tool: 'terraform' | 'tofu' | 'terragrunt'; verb: 'apply' | 'destroy'; dir: string; plan?: string; isDestroy: boolean; isAll: boolean }
 export type PlanSummary = { create: string[]; update: string[]; replace: string[]; delete: string[] }
 
 function flagValue(c: Call, ...names: string[]): string | undefined {
@@ -19,7 +19,7 @@ function flagValue(c: Call, ...names: string[]): string | undefined {
 // there, as terraform does). `isAll`: terragrunt across every module below.
 export function terraformRuns(line: string, cwd: string, home: string): TerraformRun[] {
   return calls(line, cwd, home)
-    .filter((c): c is Call & { tool: 'terraform' | 'terragrunt' } => c.tool === 'terraform' || c.tool === 'terragrunt')
+    .filter(isTerraform)
     .flatMap((c): TerraformRun[] => {
       const p = terraformWords(c)
       const chdir = flagValue(c, '-chdir', '--terragrunt-working-dir', '--working-dir')

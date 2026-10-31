@@ -1,12 +1,14 @@
 // Just enough shell reading to find which infra CLIs a command line runs and
 // whether each names its target. Not a shell: no expansion, no aliases.
 
-export type Tool = 'kubectl' | 'helm' | 'gcloud' | 'aws' | 'terraform' | 'terragrunt' | 'gh' | 'argocd'
+export type Tool = 'kubectl' | 'helm' | 'helmfile' | 'gcloud' | 'aws' | 'terraform' | 'tofu' | 'terragrunt' | 'gh' | 'argocd' | 'kubectx' | 'kubens'
 export type Step = { words: string[]; cwd: string }
 export type Call = { tool: Tool; args: string[]; env: string[]; cwd: string; text: string }
 export type ScriptRun = { path: string; cwd: string }
 
-const TOOLS = new Set<string>(['kubectl', 'helm', 'gcloud', 'aws', 'terraform', 'terragrunt', 'gh', 'argocd'])
+const TOOLS = new Set<string>(['kubectl', 'helm', 'helmfile', 'gcloud', 'aws', 'terraform', 'tofu', 'terragrunt', 'gh', 'argocd', 'kubectx', 'kubens'])
+// Drop-in replacements, read as the tool they stand in for.
+const STANDS_FOR: Record<string, Tool> = { kubecolor: 'kubectl' }
 // Words that open a command without being it.
 const KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{'])
 // Commands that run the command after them, with the flags that take a value
@@ -169,8 +171,9 @@ export function calls(line: string, cwd: string, home: string, depth = 0): Call[
     const env: string[] = []
     const at = commandIndex(words, env)
     const name = words[at]?.split('/').at(-1) ?? ''
-    if (TOOLS.has(name)) {
-      found.push({ tool: name as Tool, args: words.slice(at + 1), env, cwd: step.cwd, text: words.slice(at).join(' ') })
+    const tool = Object.hasOwn(STANDS_FOR, name) ? STANDS_FOR[name]! : name
+    if (TOOLS.has(tool)) {
+      found.push({ tool: tool as Tool, args: words.slice(at + 1), env, cwd: step.cwd, text: words.slice(at).join(' ') })
     }
     if (depth >= 2) continue
     // `-c` runs its word only after a shell (`docker exec c sh -c '...'`); for
@@ -200,9 +203,14 @@ const VALUE_FLAGS: Record<Tool, Set<string>> = {
     '--kube-ca-file', '--kube-tls-server-name', '--burst-limit', '--qps', '--registry-config', '--repository-cache', '--repository-config', '--history-max', '--max', '--template',
     '--username', '--password', '--ca-file', '--cert-file', '--key-file',
   ]),
+  helmfile: new Set([
+    '-f', '--file', '-e', '--environment', '-l', '--selector', '-n', '--namespace', '--kube-context', '-b', '--helm-binary', '-k', '--kustomize-binary', '-c', '--chart',
+    '--log-level', '--state-values-file', '--state-values-set', '--state-values-set-string', '--set', '--values', '--concurrency', '--args', '--context', '--output',
+  ]),
   gcloud: new Set(['--project', '--account', '--configuration', '--format', '--region', '--zone', '--secret', '--location', '--impersonate-service-account', '--billing-project']),
   aws: new Set(['--profile', '--region', '--output', '--query']),
   terraform: new Set(TERRAFORM_VALUES),
+  tofu: new Set(TERRAFORM_VALUES),
   terragrunt: new Set([
     ...TERRAFORM_VALUES, '--terragrunt-working-dir', '--working-dir', '--terragrunt-config', '--config', '--terragrunt-include-dir', '--queue-include-dir',
     '--terragrunt-exclude-dir', '--queue-exclude-dir', '--terragrunt-iam-role', '--iam-assume-role', '--terragrunt-log-level', '--log-level', '--terragrunt-source', '--source',
@@ -215,6 +223,8 @@ const VALUE_FLAGS: Record<Tool, Set<string>> = {
     '--retry-limit', '--retry-backoff-duration', '--strategy', '--project', '--app-namespace', '-N', '-p', '--parameter', '--dest-namespace', '--dest-server', '--dest-name',
     '--repo', '--path', '--sync-policy', '--label', '--local', '--source-position', '--source-name', '--group', '--kind', '--namespace', '--name',
   ]),
+  kubectx: new Set(),
+  kubens: new Set(),
 }
 
 // Positional words, flags and their values left out.
@@ -240,6 +250,11 @@ function hasEnv(call: Call, ...names: string[]): boolean {
   return call.env.some(e => names.some(n => e.startsWith(`${n}=`)))
 }
 
+// terraform, OpenTofu (its fork, with the same words) and terragrunt, which runs either.
+export function isTerraform(call: Call): call is Call & { tool: 'terraform' | 'tofu' | 'terragrunt' } {
+  return call.tool === 'terraform' || call.tool === 'tofu' || call.tool === 'terragrunt'
+}
+
 // The terraform words of a call: terragrunt's `run-all apply` and
 // `run --all -- apply` are `apply`.
 export function terraformWords(call: Call): string[] {
@@ -249,6 +264,7 @@ export function terraformWords(call: Call): string[] {
 
 const KUBECTL_WRITES = new Set(['apply', 'create', 'delete', 'patch', 'replace', 'scale', 'set', 'label', 'annotate', 'edit', 'drain', 'cordon', 'uncordon', 'taint', 'expose', 'autoscale', 'run', 'exec', 'cp', 'debug', 'attach', 'certificate'])
 const HELM_WRITES = new Set(['install', 'upgrade', 'uninstall', 'rollback', 'delete', 'test'])
+const HELMFILE_WRITES = new Set(['apply', 'sync', 'destroy', 'delete', 'test'])
 const GCLOUD_WRITES = new Set(['create', 'delete', 'update', 'deploy', 'resize', 'patch', 'import', 'apply', 'set-iam-policy', 'add-iam-policy-binding', 'remove-iam-policy-binding'])
 const AWS_WRITE = /^(create|delete|put|update|modify|terminate|run|start|stop|reboot|attach|detach|associate|disassociate|register|deregister|remove|add|set|import|restore|invoke)-/
 const TERRAFORM_WRITES = new Set(['apply', 'destroy', 'import', 'taint', 'untaint', 'force-unlock'])
@@ -264,11 +280,14 @@ export function isWrite(call: Call): boolean {
       return KUBECTL_WRITES.has(p[0] ?? '')
     case 'helm':
       return HELM_WRITES.has(p[0] ?? '')
+    case 'helmfile':
+      return HELMFILE_WRITES.has(p[0] ?? '')
     case 'gcloud':
       return p[0] !== 'config' && p[0] !== 'auth' && p.some(w => GCLOUD_WRITES.has(w))
     case 'aws':
       return AWS_WRITE.test(p[1] ?? '') || (p[0] === 's3' && ['rm', 'cp', 'mv', 'sync', 'rb', 'mb'].includes(p[1] ?? ''))
     case 'terraform':
+    case 'tofu':
     case 'terragrunt': {
       const t = terraformWords(call)
       return TERRAFORM_WRITES.has(t[0] ?? '') || (t[0] === 'state' && ['rm', 'mv', 'push'].includes(t[1] ?? ''))
@@ -283,6 +302,10 @@ export function isWrite(call: Call): boolean {
     case 'argocd':
       // `app sync`, `app actions run`, `proj role create-token`, `repo add`, ...
       return p.slice(1, 3).some(w => ARGOCD_WRITES.has(w) || /^(add|remove|set|delete|create|update)-/.test(w))
+    case 'kubectx':
+    case 'kubens':
+      // They edit the kubeconfig only (switchesTarget).
+      return false
   }
 }
 
@@ -293,6 +316,7 @@ export function namesTarget(call: Call): boolean {
     case 'kubectl':
       return hasFlag(call, '--context')
     case 'helm':
+    case 'helmfile':
       return hasFlag(call, '--kube-context') || hasEnv(call, 'HELM_KUBECONTEXT')
     case 'gcloud':
       return hasFlag(call, '--project') || hasEnv(call, 'CLOUDSDK_CORE_PROJECT')
@@ -303,8 +327,12 @@ export function namesTarget(call: Call): boolean {
     case 'argocd':
       return hasFlag(call, '--argocd-context', '--server') || hasEnv(call, 'ARGOCD_SERVER')
     case 'terraform':
+    case 'tofu':
     case 'terragrunt':
       return true
+    case 'kubectx':
+    case 'kubens':
+      return false
   }
 }
 
@@ -315,6 +343,13 @@ export function switchesTarget(call: Call): boolean {
   if (call.tool === 'gcloud') return p[0] === 'config' && ((p[1] === 'set' && p[2] === 'project') || (p[1] === 'configurations' && p[2] === 'activate'))
   if (call.tool === 'gh') return p[0] === 'auth' && p[1] === 'switch'
   if (call.tool === 'argocd') return p[0] === 'login' || (p[0] === 'context' && p[1] !== undefined && !hasFlag(call, '--delete'))
+  if (call.tool === 'kubectx' || call.tool === 'kubens') {
+    // `kubectx NAME`, `kubectx -` (the previous one) and `-u` switch; `-c`
+    // prints, `-d` deletes, `NEW=OLD` renames, and no argument lists.
+    if (hasFlag(call, '-u', '--unset')) return true
+    if (hasFlag(call, '-c', '--current', '-d', '--delete', '-h', '--help', '-V', '--version')) return false
+    return call.args.includes('-') || p.some(w => !w.includes('='))
+  }
   return false
 }
 

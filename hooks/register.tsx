@@ -32,12 +32,14 @@ import { ghRunProgress, rolloutProgress } from './watch'
 // Guards for infra work from Claude Code:
 // 1. the ambient targets in a band above the prompt, told to Claude when they
 //    change; direct kubectl/helm changes must name their context, and
-//    scripts are read before they run for commands that take the ambient one;
+//    scripts are read before they run for commands that take the ambient one
+//    (a command line run by Bash or as a Monitor's script alike);
 // 2. terraform apply only from a saved plan the person approved;
 // 3. every infra change logged with the targets of the moment (/timeline);
 // 4. read-only watches the mod polls itself, waking Claude when one ends;
 // 5. Secret values the model never sees (secrets.ts): tools that write them,
-//    commands that would print them refused, output carrying them withheld;
+//    commands that would print them refused, output carrying them withheld,
+//    and a background task's notification carrying one dropped;
 // 6. a call the person approved in one of these dialogs runs on that answer,
 //    the permission mode not asking again, when the dialog showed the whole
 //    command line (approval.ts).
@@ -53,7 +55,15 @@ const AUDIT_LIMIT = 1000
 const TICK_MS = 5000
 const FINISHED_SHOWN = 3
 // Direct changes to a cluster must say which one; a script is asked about instead.
-const CONTEXT_FLAG: Partial<Record<Call['tool'], string>> = { kubectl: 'kubectl --context', helm: 'helm --kube-context', argocd: 'argocd --argocd-context' }
+const CONTEXT_FLAG: Partial<Record<Call['tool'], string>> = {
+  kubectl: 'kubectl --context',
+  helm: 'helm --kube-context',
+  helmfile: 'helmfile --kube-context',
+  argocd: 'argocd --argocd-context',
+}
+// The flag outranks a kubeContext under helmDefaults or an environment, so
+// passing the ambient one could move a helmfile that names its own.
+const HELMFILE_NOTE = ' If the helmfile sets kubeContext itself, pass that same context.'
 
 const targets = atom({ plugin: 'infra-guard', key: 'targets' } as const, null as Targets | null)
 const watches = atom({ plugin: 'infra-guard', key: 'watches' } as const, [] as Watch[])
@@ -231,7 +241,8 @@ function directGate(found: Call[], t: Targets | null, read: ReadOptions): Gate {
     const flag = CONTEXT_FLAG[call.tool]
     if (flag !== undefined && isWrite(call) && !namesTarget(call)) {
       const ambient = call.tool === 'argocd' ? `ambient argocd context: ${t?.argocd ?? 'unset'}` : `ambient kube-context: ${t?.kube ?? 'unset'}`
-      return { deny: `${PLUGIN}: refused, a command that changes a cluster must name its target with ${flag} (${ambient}).` }
+      const note = call.tool === 'helmfile' ? HELMFILE_NOTE : ''
+      return { deny: `${PLUGIN}: refused, a command that changes a cluster must name its target with ${flag} (${ambient}).${note}` }
     }
   }
   return {}
@@ -358,6 +369,80 @@ function pasteField($: Engine, e: Parameters<Engine['ui']['resolve']>[0], p: Pen
       <Button key="secret-cancel" label="Cancel" onPress={() => endPaste($, undefined, true)} />
     </Box>
   )
+}
+
+// A command line Claude runs, by Bash or as a Monitor's script: the gates,
+// then the run, its audit row and a note when the targets changed.
+async function guarded<R extends Ran & { isError?: true; context?: readonly string[] }>(
+  $: Engine,
+  command: string,
+  toolUseId: string | undefined,
+  run: () => Promise<R>,
+  reads: ReadOptions,
+  prod: RegExp,
+) {
+  const w = await where($)
+  const found = calls(command, w.cwd, w.home)
+  const runs = scriptRuns(command, w.cwd, w.home)
+  if (found.length === 0 && runs.length === 0) return withheld(await run())
+
+  const started = await $.clock.now()
+  const before = (await read($, targets)) ?? (await refresh($))
+  const asShown = shown(command)
+  let gate = directGate(found, before, reads)
+  if (gate.deny === undefined) gate = await terraformGate($, command, w, asShown)
+  if (gate.deny === undefined && runs.length > 0) {
+    const scripted = await scriptGate($, command, w, before, prod, asShown)
+    gate = { deny: scripted.deny, confirmed: [gate.confirmed, scripted.confirmed].filter(Boolean).join('; ') || undefined }
+  }
+  // Approved in a dialog that showed the whole line, the call is not asked
+  // about again (tool.check below); a line too long to show is.
+  const id = gate.deny === undefined && gate.confirmed !== undefined && asShown.whole ? toolUseId : undefined
+  if (id !== undefined) approved.add(id)
+  const raw: R | { deny: string; isError?: undefined } =
+    gate.deny === undefined ? await run().finally(() => id !== undefined && approved.delete(id)) : { deny: gate.deny }
+  const confirmed =
+    id !== undefined && overruled.delete(id)
+      ? `${gate.confirmed}; the permission check asked, ${PLUGIN} allowed it`
+      : gate.confirmed !== undefined && !asShown.whole
+        ? `${gate.confirmed}; too long to show whole, left to the permission check`
+        : gate.confirmed
+  const ran = withheld(raw)
+  const after = await refresh($)
+
+  if (gate.deny !== undefined || found.some(c => isWrite(c) || switchesTarget(c)) || runs.length > 0) {
+    await record($, {
+      at: new Date(started).toISOString(),
+      session: await $.session.id(),
+      cwd: w.cwd,
+      command: mask(scrub(command)),
+      targets: before,
+      outcome: raw.deny !== undefined ? 'refused' : raw.isError ? 'error' : gate.confirmed ? 'confirmed' : 'ok',
+      note: raw.deny !== undefined ? raw.deny.slice(0, 160) : ran.deny !== undefined ? 'output withheld' : confirmed,
+      ms: (await $.clock.now()) - started,
+    })
+  }
+
+  if (ran.deny !== undefined) return ran
+  // Not refused and not withheld: what the tool itself answered.
+  const answered = ran as R
+  const line = targetLine(after)
+  if (line === announced) return answered
+  announced = line
+  return { ...answered, context: [...(answered.context ?? []), `${PLUGIN}: ambient targets now: ${line}`] }
+}
+
+// A call the person approved in a dialog here runs on that answer: an ask
+// would go to the permission mode, in auto mode its classifier. A failure here
+// is skipped, leaving the verdict beneath, which asks as it did before. Each
+// allow is said in the transcript (not to Claude) and in the audit note.
+async function allowApproved<V extends Parameters<typeof settle>[0]>($: Engine, id: string | undefined, verdict: V) {
+  const settled = settle(verdict, id, approved)
+  if (settled !== verdict && id !== undefined) {
+    overruled.add(id)
+    $.ui.log(`${PLUGIN}: allowed this command at the permission check, on your answer in its dialog`)
+  }
+  return settled
 }
 
 export const register: Register = (on, options) => {
@@ -516,73 +601,34 @@ export const register: Register = (on, options) => {
     return { text: timeline(kept, Number.isFinite(n) && n > 0 ? Math.min(n, 200) : 20) }
   })
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const w = await where($)
-    const found = calls(e.command, w.cwd, w.home)
-    const runs = scriptRuns(e.command, w.cwd, w.home)
-    if (found.length === 0 && runs.length === 0) return withheld(await next(e))
+  const checkFailed = `${PLUGIN}: its check failed, so the command was refused`
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => guarded($, e.command, e.tool_use_id, () => next(e), reads, prod)).catch(async ($, e, next) =>
+    next.called ? withheld(await next(e)) : { deny: checkFailed },
+  )
+  // A Monitor runs its command in the same shell as Bash; one that opens a
+  // WebSocket runs none. Its events reach Claude as notifications (below).
+  on('tool.call', { tool: 'Monitor' }, ($, e, next) =>
+    e.command === undefined ? next(e) : guarded($, e.command, e.tool_use_id, () => next(e), reads, prod),
+  ).catch(async ($, e, next) => (next.called ? withheld(await next(e)) : { deny: checkFailed }))
 
-    const started = await $.clock.now()
-    const before = (await read($, targets)) ?? (await refresh($))
-    const asShown = shown(e.command)
-    let gate = directGate(found, before, reads)
-    if (gate.deny === undefined) gate = await terraformGate($, e.command, w, asShown)
-    if (gate.deny === undefined && runs.length > 0) {
-      const scripted = await scriptGate($, e.command, w, before, prod, asShown)
-      gate = { deny: scripted.deny, confirmed: [gate.confirmed, scripted.confirmed].filter(Boolean).join('; ') || undefined }
-    }
-    // Approved in a dialog that showed the whole line, the call is not asked
-    // about again (tool.check below); a line too long to show is.
-    const id = gate.deny === undefined && gate.confirmed !== undefined && asShown.whole ? e.tool_use_id : undefined
-    if (id !== undefined) approved.add(id)
-    const raw = gate.deny === undefined ? await next(e).finally(() => id !== undefined && approved.delete(id)) : { deny: gate.deny }
-    const confirmed =
-      id !== undefined && overruled.delete(id)
-        ? `${gate.confirmed}; the permission check asked, ${PLUGIN} allowed it`
-        : gate.confirmed !== undefined && !asShown.whole
-          ? `${gate.confirmed}; too long to show whole, left to the permission check`
-          : gate.confirmed
-    const ran = withheld(raw)
-    const after = await refresh($)
-
-    if (gate.deny !== undefined || found.some(c => isWrite(c) || switchesTarget(c)) || runs.length > 0) {
-      await record($, {
-        at: new Date(started).toISOString(),
-        session: await $.session.id(),
-        cwd: w.cwd,
-        command: mask(scrub(e.command)),
-        targets: before,
-        outcome: raw.deny !== undefined ? 'refused' : raw.isError ? 'error' : gate.confirmed ? 'confirmed' : 'ok',
-        note: raw.deny !== undefined ? raw.deny.slice(0, 160) : ran.deny !== undefined ? 'output withheld' : confirmed,
-        ms: (await $.clock.now()) - started,
-      })
-    }
-
-    if (ran.deny !== undefined) return ran
-    const line = targetLine(after)
-    if (line === announced) return ran
-    announced = line
-    return { ...ran, context: [...(ran.context ?? []), `${PLUGIN}: ambient targets now: ${line}`] }
-  }).catch(async ($, e, next) => (next.called ? withheld(await next(e)) : { deny: `${PLUGIN}: its check failed, so the command was refused` }))
-
-  // A Bash call the person approved in a dialog here runs on that answer: an ask
-  // would go to the permission mode, in auto mode its classifier. A failure here
-  // is skipped, leaving the verdict beneath, which asks as it did before. Each
-  // allow is said in the transcript (not to Claude) and in the audit note.
-  on('tool.check', { tool: 'Bash' }, async ($, e, next) => {
-    const verdict = await next(e)
-    const settled = settle(verdict, e.tool_use_id, approved)
-    if (settled !== verdict && e.tool_use_id !== undefined) {
-      overruled.add(e.tool_use_id)
-      $.ui.log(`${PLUGIN}: allowed this command at the permission check, on your answer in its dialog`)
-    }
-    return settled
-  })
+  on('tool.check', { tool: 'Bash' }, async ($, e, next) => allowApproved($, e.tool_use_id, await next(e)))
+  on('tool.check', { tool: 'Monitor' }, async ($, e, next) => allowApproved($, e.tool_use_id, await next(e)))
 
   // Every other tool: output carrying a known value never reaches the model.
   on('tool.call', async ($, e, next) => (e.tool === 'Bash' ? next(e) : withheld(await next(e)))).catch(() => ({
     deny: `${PLUGIN}: its output check failed, so the output was withheld`,
   }))
+
+  // A background task's notification (a Monitor's events, a background
+  // command's end) carrying a known value never reaches the model. Dropped
+  // whole, not rewritten: the engine documents no rewrite of a notification
+  // that starts a turn. Claude hears that one was,
+  // from a dispatch of its own: a submit inside this hook would wait on itself.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin?.kind !== 'task-notification' || !hasKnown() || !carriesKnown(e.text)) return next(e)
+    $.clock.after(0, () => void $.prompt.submit({ text: `${PLUGIN}: a background task's notification carried a Secret value this guard manages, so it was withheld` }))
+    return { drop: `${PLUGIN}: withheld a background task's notification that carried a Secret value` }
+  }).catch(($, e, next) => (next.called || e.origin?.kind !== 'task-notification' ? next(e) : { drop: `${PLUGIN}: its notification check failed, so it was withheld` }))
 
   // Every stored row: a known value is replaced before it is kept or sent.
   on('session.append', ($, e, next) => {

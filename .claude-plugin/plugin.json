@@ -1,7 +1,7 @@
 {
   "name": "infra-guard",
-  "version": "0.5.2",
-  "description": "Guards infra work from Claude Code: shows the ambient kube/gcloud/gh/aws/argocd targets, requires named contexts and approved terraform/terragrunt plans, reads scripts before they run, keeps Secret values from the model, logs changes and watches rollouts.",
+  "version": "0.6.0",
+  "description": "Guards infra work from Claude Code: shows the ambient kube/gcloud/gh/aws/argocd targets, requires named contexts and approved terraform/OpenTofu/terragrunt plans, reads scripts before they run, keeps Secret values from the model, logs changes and watches rollouts.",
   "author": {
     "name": "Jerry Chuang",
     "url": "https://github.com/dfgh012316"
@@ -9,7 +9,7 @@
   "homepage": "https://github.com/dfgh012316/infra-guard",
   "repository": "https://github.com/dfgh012316/infra-guard",
   "license": "Apache-2.0",
-  "keywords": ["kubernetes", "kubectl", "helm", "terraform", "terragrunt", "argocd", "secrets", "devops", "sre", "guardrails"],
+  "keywords": ["kubernetes", "kubectl", "helm", "helmfile", "terraform", "opentofu", "terragrunt", "argocd", "secrets", "devops", "sre", "guardrails"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "prodPattern": {

@@ -349,3 +349,32 @@ test('no field opens for a Secret a controller writes back', async ($, on) => {
   expect(opened).toBe(0)
   expect(audit().at(-1)?.outcome).toBe('refused')
 })
+
+test('drops a background task notification carrying a known value, and tells Claude one was', async ($, on) => {
+  let written = ''
+  const { clock } = engine(on, { answer: 'Rotate' })
+  on('process.run', ($, e) => {
+    if (e.argv[5] === 'get') return exited(0, JSON.stringify({ type: 'Opaque', data: written ? (JSON.parse(written) as { data: Record<string, string> }).data : {} }))
+    if (e.argv[5] === 'replace') {
+      written = e.init?.stdin ?? ''
+      return exited(0, 'secret/app replaced')
+    }
+    return exited(1, '', 'unexpected')
+  })
+  const told: string[] = []
+  on('prompt.submit', ($, e) => {
+    told.push(e.text)
+    return { text: e.text }
+  })
+  await $.tool.call({ tool: ROTATE, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'TOKEN' })
+  const minted = atob((JSON.parse(written) as { data: { TOKEN: string } }).data.TOKEN)
+  const notification = { origin: { kind: 'task-notification' }, wait: false } as const
+
+  const leaked = await $.prompt.submit({ ...notification, text: `<task-notification>TOKEN=${minted}</task-notification>` })
+  expect(leaked.drop).toContain('withheld')
+  const ordinary = await $.prompt.submit({ ...notification, text: '<task-notification>pods ready</task-notification>' })
+  expect(ordinary.drop).toBeUndefined()
+  await clock.settle()
+  expect(told.some(t => t.includes(minted))).toBe(false)
+  expect(told.some(t => t.includes('notification carried a Secret value'))).toBe(true)
+})

@@ -108,6 +108,39 @@ describe('reading command lines', () => {
   })
 })
 
+describe('more infra CLIs', () => {
+  const one = (line: string) => calls(line, '/w', HOME)[0]!
+
+  test('reads OpenTofu as terraform, and kubecolor as kubectl', () => {
+    expect(one('tofu apply tfplan').tool).toBe('tofu')
+    expect(isWrite(one('tofu apply tfplan'))).toBe(true)
+    expect(isWrite(one('tofu plan -out=tfplan'))).toBe(false)
+    const colored = one('kubecolor delete pod x')
+    expect(colored.tool).toBe('kubectl')
+    expect(isWrite(colored) && !namesTarget(colored)).toBe(true)
+    expect(namesTarget(one('kubecolor --context dev delete pod x'))).toBe(true)
+  })
+
+  test('reads helmfile writes and the context they name', () => {
+    expect(isWrite(one('helmfile -e prod -f helmfile.yaml apply'))).toBe(true)
+    expect(isWrite(one('helmfile -e prod diff'))).toBe(false)
+    expect(namesTarget(one('helmfile -e prod apply'))).toBe(false)
+    expect(namesTarget(one('helmfile --kube-context prod-gke -e prod sync'))).toBe(true)
+    expect(namesTarget(one('HELM_KUBECONTEXT=prod-gke helmfile apply'))).toBe(true)
+  })
+
+  test('counts kubectx and kubens as switching the target, not as changes', () => {
+    for (const line of ['kubectx prod', 'kubectx -', 'kubectx -u', 'kubens payments', 'kubens -']) expect(switchesTarget(one(line))).toBe(true)
+    for (const line of ['kubectx', 'kubectx -c', 'kubectx -d old', 'kubectx new=old', 'kubens -c']) expect(switchesTarget(one(line))).toBe(false)
+    expect(isWrite(one('kubectx prod'))).toBe(false)
+  })
+
+  test('flags them in a script', () => {
+    const { findings } = scanScript('/w/up.sh', 'kubectx prod\ntofu apply -auto-approve\nhelmfile -e prod apply\n', HOME, '/w')
+    expect(findings.map(f => f.why)).toEqual(['switches', 'terraform', 'ambient'])
+  })
+})
+
 describe('reading scripts', () => {
   test('flags an upgrade.sh that runs helm on the ambient context', () => {
     const text = [
@@ -323,6 +356,17 @@ describe('the Bash hook', () => {
     expect(second.context).toBeUndefined()
   })
 
+  test('gates OpenTofu like terraform, and helmfile and kubecolor like helm and kubectl', async ($, on) => {
+    const { ran } = engine(on)
+    on('process.run', () => exited(0, 'dev\n'))
+    expect(refused(await $.tool.call({ tool: 'Bash', command: 'tofu apply -auto-approve' }))).toContain('tofu plan -out=tfplan')
+    const helmfile = refused(await $.tool.call({ tool: 'Bash', command: 'helmfile -e prod apply' }))
+    expect(helmfile).toContain('helmfile --kube-context')
+    expect(helmfile).toContain('sets kubeContext itself')
+    expect(refused(await $.tool.call({ tool: 'Bash', command: 'kubecolor delete pod x' }))).toContain('kubectl --context')
+    expect(ran.length).toBe(0)
+  })
+
   test('lets a heredoc that writes a deploy script through', async ($, on) => {
     const { ran } = engine(on)
     on('process.run', () => exited(0, 'prod-cluster\n'))
@@ -330,5 +374,33 @@ describe('the Bash hook', () => {
     const r = await $.tool.call({ tool: 'Bash', command })
     expect(refused(r)).toBeUndefined()
     expect(ran).toEqual([command])
+  })
+})
+
+describe('the Monitor tool', () => {
+  const watch = { tool: 'Monitor', description: 'pods', timeout_ms: 300_000 } as const
+
+  test('runs its command through the checks Bash gets', async ($, on) => {
+    const { audit } = engine(on)
+    const started: string[] = []
+    on('tool.call', { tool: 'Monitor' }, ($, e) => {
+      started.push(e.command ?? e.ws?.url ?? '')
+      return { result: { taskId: 't1', timeoutMs: 300_000 } }
+    })
+    on('process.run', () => exited(0, 'prod-cluster\n'))
+    expect(refused(await $.tool.call({ ...watch, command: 'kubectl delete pod x; kubectl get pods -w' }))).toContain('kubectl --context')
+    expect(refused(await $.tool.call({ ...watch, command: 'kubectl --context dev get secret app -o yaml' }))).toContain('Secret data')
+    expect(refused(await $.tool.call({ ...watch, command: 'kubectl --context dev get pods -w' }))).toBeUndefined()
+    expect(refused(await $.tool.call({ ...watch, ws: { url: 'wss://events.example.invalid' } }))).toBeUndefined()
+    expect(started).toEqual(['kubectl --context dev get pods -w', 'wss://events.example.invalid'])
+    expect(audit().map(a => a.outcome)).toEqual(['refused', 'refused'])
+  })
+
+  test('reads a script it runs before it runs', async ($, on) => {
+    const { asked } = engine(on, { files: { '/w/tail.sh': 'kubectl rollout restart deploy/api\nkubectl get pods -w\n' } })
+    on('tool.call', { tool: 'Monitor' }, () => ({ result: { taskId: 't1', timeoutMs: 300_000 } }))
+    on('process.run', () => exited(0, 'prod-cluster\n'))
+    expect(refused(await $.tool.call({ ...watch, command: './tail.sh' }))).toContain('tail.sh:1')
+    expect(asked[0]).toContain('PRODUCTION')
   })
 })

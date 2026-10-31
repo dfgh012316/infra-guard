@@ -23,7 +23,7 @@ export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok
     store.set(e.key, e.value)
     return { value: undefined }
   })
-  mock.clock(on)
+  const clock = mock.clock(on)
   mock.env(on, { HOME })
   on('session.cwd', () => ({ value: '/w' }))
   on('session.id', () => ({ value: 'session-1' }))
@@ -38,5 +38,5 @@ export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok
     ran.push(e.command)
     return { result: { stdout: bash(), stderr: '', interrupted: false } }
   })
-  return { ran, asked, audit: () => (store.get('audit') as AuditEntry[] | undefined) ?? [] }
+  return { ran, asked, clock, audit: () => (store.get('audit') as AuditEntry[] | undefined) ?? [] }
 }

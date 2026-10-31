@@ -1,4 +1,4 @@
-import { calls, isWrite, namesTarget, scriptRuns, steps, switchesTarget, withoutHeredocs, type ScriptRun } from './shell'
+import { calls, isTerraform, isWrite, namesTarget, scriptRuns, steps, switchesTarget, withoutHeredocs, type ScriptRun } from './shell'
 
 // What a script would run against the ambient target, line by line, and the
 // scripts it runs in turn. Relative paths resolve from the directory the
@@ -21,7 +21,7 @@ export function scanScript(file: string, text: string, home: string, cwd: string
     while (line.endsWith('\\') && i + 1 < lines.length) line = `${line.slice(0, -1)} ${lines[++i]!}`
     for (const call of calls(line, dir, home)) {
       const why =
-        (call.tool === 'terraform' || call.tool === 'terragrunt') && isWrite(call)
+        isTerraform(call) && isWrite(call)
           ? 'terraform'
           : switchesTarget(call)
             ? 'switches'
