@@ -249,7 +249,7 @@ describe('targets, audit and watches', () => {
       'kubectl create secret generic s --from-literal=TOKEN=*** DB_PASSWORD=***',
     )
     const entry = (at: string, command: string): AuditEntry => ({ at, session: 's', cwd: '/w', command, targets: { kube: 'dev' }, outcome: 'ok', ms: 5 })
-    expect(mask(`kubectl --context prod patch secret app -p '{"data":{"TOKEN":"c2VjcmV0LXZhbHVlLTEyMzQ="}}'`)).toBe(
+    expect(mask(`kubectl --context prod patch secret app -p '{"data":{"TOKEN":"c2VjcmV0LXZhbHVlLTEyMzQ="}}'`)).toBe( // gitleaks:allow: base64 of a dummy
       `kubectl --context prod patch secret app -p '{"data":{***}}'`,
     )
     expect(mask('DATABASE_URL=postgres://app:hunter2hunter2@10.0.0.5/app ./run.sh')).toBe('DATABASE_URL=postgres://app:***@10.0.0.5/app ./run.sh')
@@ -461,7 +461,7 @@ describe('the script review', () => {
     expect((await p.find({ key: 'review-run' }))?.props).toMatchObject({ hotkey: 'r', plain: true })
     expect((await p.find({ key: 'review-cancel' }))?.props).toMatchObject({ hotkey: 'c', plain: true })
     await p.press({ key: 'review-run' })
-    expect(s.told.at(-1)).toContain('approved the run')
+    expect(s.told.at(-1)).toContain('pressed Run')
     expect(s.closed).toContain('script-review')
 
     expect(refused(await $.tool.call(RUN))).toBeUndefined()

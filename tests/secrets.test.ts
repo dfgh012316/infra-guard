@@ -5,6 +5,7 @@ import { BAND, engine, exited, PANE, refused } from './helpers'
 
 const ROTATE = 'mcp__infra-guard__secret_rotate'
 const SET = 'mcp__infra-guard__secret_set'
+const LEAK = 'mcp__infra-guard__leak_check'
 
 test('refuses commands that print Secret data', async ($, on) => {
   const { ran } = engine(on)
@@ -418,3 +419,31 @@ test('says nothing while the result rows come by', async ($, on) => {
   expect(await ui.find({ text: /transcript scrub is off/ })).toBeUndefined()
 })
 
+
+test("leak_check searches ~/.claude and Claude Code's temp folder unless given paths", async ($, on) => {
+  let stored: Record<string, string> = {}
+  const searched: string[][] = []
+  engine(on, { answer: 'Rotate', env: { CLAUDE_CODE_TMPDIR: '/srv/ctmp/', TMPDIR: '/var/tmp' } })
+  on('process.run', ($, e) => {
+    if (e.argv[0] === 'id') return exited(0, '501\n')
+    if (e.argv[0] === 'grep') {
+      searched.push([...e.argv])
+      return exited(1, '')
+    }
+    if (e.argv[5] === 'get') return exited(0, JSON.stringify({ type: 'Opaque', data: stored }))
+    if (e.argv[5] === 'replace') {
+      stored = (JSON.parse(e.init?.stdin ?? '{}') as { data: Record<string, string> }).data
+      return exited(0, 'secret/app replaced')
+    }
+    return exited(1, '', 'unexpected')
+  })
+  expect(refused(await $.tool.call({ tool: ROTATE, context: 'k3d-ksg-spike', namespace: 'spike', secret: 'app', key: 'TOKEN' }))).toBeUndefined()
+
+  // Where a Monitor's raw output lands, beside the transcripts.
+  expect(refused(await $.tool.call({ tool: LEAK }))).toBeUndefined()
+  expect(searched.at(-1)?.slice(-2)).toEqual(['/home/u/.claude', '/srv/ctmp/claude-501'])
+  expect(searched.at(-1)).toContain('skip')
+  await $.tool.call({ tool: LEAK, paths: ['/srv/logs'] })
+  expect(searched.at(-1)?.at(-1)).toBe('/srv/logs')
+  expect(searched.at(-1)).not.toContain('/home/u/.claude')
+})

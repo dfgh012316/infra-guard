@@ -292,8 +292,9 @@ async function endReview($: Engine, approved: boolean, closePane: boolean) {
   const names = shown?.scripts.map(s => s.path).join(', ') || 'the script'
   await $.prompt.submit({
     text: approved
-      ? `${PLUGIN}: the person reviewed ${names} and approved the run. Run the same command again now, unchanged, from ${shown?.cwd ?? run.cwd}.`
-      : `${PLUGIN}: the person reviewed ${names} and did not run it. Pass the target explicitly (kubectl --context, helm --kube-context, ` +
+      ? `${PLUGIN}: in ${PLUGIN}'s review pane, the person read ${names} and pressed Run. ` +
+        `Run the same command again now, unchanged, from ${shown?.cwd ?? run.cwd}: it runs once, as they reviewed it.`
+      : `${PLUGIN}: the person reviewed ${names} in ${PLUGIN}'s review and did not run it. Pass the target explicitly (kubectl --context, helm --kube-context, ` +
         'gcloud --project, aws --profile), or ask them what to change.',
   })
 }
@@ -592,7 +593,8 @@ async function allowApproved<V extends Parameters<typeof settle>[0]>($: Engine, 
   const settled = settle(verdict, id, approved)
   if (settled !== verdict && id !== undefined) {
     overruled.add(id)
-    $.ui.log(`${PLUGIN}: allowed this command at the permission check, on your answer in its dialog`)
+    // Claude Code puts the plugin's name before the line.
+    $.ui.log('allowed this command at the permission check, as you approved it')
   }
   return settled
 }
@@ -691,7 +693,8 @@ export const register: Register = (on, options) => {
       name: 'leak_check',
       description:
         'Searches files for every Secret value this guard has minted or read in this session and answers only the names ' +
-        'of files that hold one. Default folder: ~/.claude (transcripts, history, debug logs).',
+        'of files that hold one. Default folders: ~/.claude (transcripts, history, debug logs) and Claude Code\'s temp ' +
+        'folder (the raw output of Monitors and background commands).',
       inputSchema: {
         type: 'object',
         properties: { paths: { type: 'array', items: { type: 'string' }, description: 'absolute folders or files' } },

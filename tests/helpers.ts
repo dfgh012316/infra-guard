@@ -15,11 +15,11 @@ export function refused(r: { deny?: string; isError?: true; text?: string }): st
   return r.deny ?? (r.isError ? r.text : undefined)
 }
 
-type Options = { files?: Record<string, string>; answer?: string; bash?: () => string }
+type Options = { files?: Record<string, string>; answer?: string; bash?: () => string; env?: Record<string, string> }
 
 // Stands in for the engine around the mod: cwd, env, store, clock, files, the
 // person's answer to every dialog, and Bash itself. A test adds process.run.
-export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok' }: Options = {}) {
+export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok', env = {} }: Options = {}) {
   const store = new Map<string, unknown>()
   on('store.get', ($, e) => ({ value: store.get(e.key) }))
   on('store.set', ($, e) => {
@@ -27,7 +27,7 @@ export function engine(on: On, { files = {}, answer = 'Cancel', bash = () => 'ok
     return { value: undefined }
   })
   const clock = mock.clock(on)
-  mock.env(on, { HOME })
+  mock.env(on, { HOME, ...env })
   on('session.cwd', () => ({ value: '/w' }))
   on('session.id', () => ({ value: 'session-1' }))
   on('fs.read', ($, e) => (e.path in files ? { value: files[e.path]! } : { deny: 'missing' }))

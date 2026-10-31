@@ -1,0 +1,42 @@
+name: test
+
+# The mod runs inside Claude Code, whose mod engine changes with its releases:
+# besides each push, a daily run against the latest release catches one that
+# breaks it. A scheduled failure mails the repository's owner.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Claude Code ${{ matrix.claude-code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The release this version was tested on, and whatever is newest.
+        claude-code: ['2.1.316', 'latest']
+    env:
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install --global "@anthropic-ai/claude-code@${{ matrix.claude-code }}"
+      - run: claude --version
+      # Neither needs a login: both run the hooks module in Claude Code's own
+      # engine, with external commands and dialogs replaced by the tests' fakes.
+      - name: Validate
+        run: claude plugin validate --strict .
+      - name: Unit tests
+        run: claude plugin test .

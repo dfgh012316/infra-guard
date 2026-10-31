@@ -1,10 +1,12 @@
 # infra-guard
 
+[![test](https://github.com/dfgh012316/infra-guard/actions/workflows/test.yml/badge.svg)](https://github.com/dfgh012316/infra-guard/actions/workflows/test.yml)
+
 Guardrails for infrastructure work in [Claude Code](https://code.claude.com). It shows which cluster, project and account Claude is pointed at, makes cluster changes name their target, reads scripts before they run, gates `terraform apply` on a plan a person approved, and lets Claude rotate Kubernetes Secrets without ever seeing the values.
 
 It is a Claude Code **mod**: a plugin with a hooks module that runs inside Claude Code, so the checks run on every tool call instead of depending on Claude remembering a rule in `CLAUDE.md`.
 
-> Status: early (0.x). Tested on the Linux CLI (WSL2) with Claude Code 2.1.301–2.1.302, and on the macOS CLI with 2.1.302 against GKE (all but `secret_rotate` and `secret_set`); the unit tests pass on 2.1.316. The VS Code extension is untested. If you do not see the target line above the prompt, the guards are not running.
+> Status: early (0.x). The unit tests run on every push and daily against the latest Claude Code release (CI above). In a real session, the guards through 0.5 were tested on the Linux CLI (WSL2) with Claude Code 2.1.301–2.1.302, and on the macOS CLI with 2.1.302 against GKE (all but `secret_rotate` and `secret_set`); those added in 0.6 to 0.8 (the Monitor tool, notifications, the scrub warning, the script review) on the Linux CLI (WSL2) with 2.1.316, by the in-session checks in [docs/verification.md](docs/verification.md), which records each run. In the VS Code extension Claude Code draws nothing a mod draws, so there is no band and the script check asks in a dialog (untested). If you do not see the target line above the prompt in a terminal, the guards are not running.
 
 ## Why
 
@@ -32,7 +34,7 @@ Reading that script before running it was not enough: it was read to see how it 
 | `mcp__infra-guard__secret_rotate` | Sets a key to a new random value (16–128 characters) after confirmation, then reads it back to verify. |
 | `mcp__infra-guard__secret_set` | Same, with a value the person supplies (a token a vendor issued). By default the mod opens a field to paste it into: a pane that takes the keys at once, or, where no pane is placed, a field above the prompt that ctrl+x tab reaches. It returns at once, and Claude gets a message when the value is set or cancelled (Cancel, or Esc in the pane). With `file`, it reads a file the person wrote instead (an absolute path; one trailing newline is dropped) and asks to confirm with its length and fingerprint. |
 | `mcp__infra-guard__secret_keys` | Lists keys with byte sizes and session-scoped fingerprints; warns when `last-applied-configuration` holds a plaintext copy. |
-| `mcp__infra-guard__leak_check` | Searches files (default `~/.claude`) for every value the mod has seen this session and answers file names only. |
+| `mcp__infra-guard__leak_check` | Searches files for every value the mod has seen this session and answers file names only. By default it searches `~/.claude` and Claude Code's temp folder (`$CLAUDE_CODE_TMPDIR`, else the system's, then `claude-<uid>`), where a `Monitor`'s or background command's raw output lands. |
 | `mcp__infra-guard__watch_start` / `watch_stop` | Start or stop a rollout or GitHub Actions watch. |
 
 ## Install
@@ -70,6 +72,7 @@ infra-guard catches mistakes. It does not stop someone, or a model, determined t
 - **Dialog answers can leave the machine.** In proxy captures of Claude Code 2.1.302 signed in with claude.ai, a value typed into a dialog (under "Other") never reached the model or the local transcript. With [Remote Control](https://code.claude.com/docs/en/remote-control) connected (as `remoteControlAtStartup: true` does for every session), it was sent to Anthropic in the session's event stream (`POST /v1/code/sessions/<id>/worker/events`). With Remote Control off, the session sent no `/v1/code/sessions` requests, and the value was in none of its 44 requests. Remote Control is one setting away for every session, so `secret_set` never takes a value through a dialog, and the mod's dialogs carry only key names, lengths and fingerprints. In the same kind of capture, with Remote Control connected, a value pasted into the mod's own field (0.5.0) appeared in none of the 208 requests the session sent, nor in any of Claude Code's files on disk.
 - **The paste field shows what you paste.** It has no masked mode; it closes on Enter. A pane the mod opens on its own is placed from 144 terminal columns; narrower, the field sits above the prompt instead.
 - **The value file is yours to guard.** Claude is told only its path. The mod knows the value once it has read the file, so output carrying it is withheld from then on; a read of the file before that is not caught. Write it in your own terminal and delete it when the Secret is set.
+- **Claude Code writes some output to disk before the mod sees it.** A `Monitor`'s events and a background command's output go to `tasks/<id>.output` under Claude Code's temp folder, and a result too large to inline to `tool-results/` under `~/.claude/projects/`. Withholding a result or dropping a notification keeps a value from Claude, not off the disk. `leak_check` searches both by default; delete the files it names.
 - **The audit log is local.** Plaintext JSON under `~/.claude/plugins/store/`, last 1000 entries, shared by sessions on the machine, not atomic and not tamper-proof. It records commands Claude ran and the secret tools' writes, never a value.
 - **Failures.** If the Bash or Monitor check throws before the command runs, a line that names an infra CLI or a script (by spelling alone) is refused, and any other runs with its output still checked; if the output check throws, the output is withheld. Claude Code skips a hook whose own error handler fails, so this is not a guarantee.
 - **Mods are not sandboxed.** This one runs `kubectl`, `terraform`, `gh` and `grep` as you, and reads gcloud, gh and AWS config files. It makes no network requests of its own. Run `claude plugin validate .` to list every hook and API it uses.
@@ -82,6 +85,8 @@ Desktop app WSL sessions do not load plugins, so the guards do not run there.
 claude plugin validate --strict .   # manifest, hooks, and the APIs the mod calls
 claude plugin test .                 # unit tests, run by Claude Code's engine
 ```
+
+Neither needs a login. CI ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs both on each push and pull request, and daily against the newest Claude Code release beside the one the current version was tested on, as a release of Claude Code can change the mod engine under the mod. Before a release, run the in-session checks in [docs/verification.md](docs/verification.md): they cover what the tests' fakes cannot (the pane and the band as drawn, the keys, how Claude takes a refusal, and other plugins' hooks around this one). `verify/setup.sh` lays out the sandbox they run in.
 
 TypeScript types for the mod API are generated into `.claude-plugin/types/` when Claude Code loads the mod (for example `claude --plugin-dir .`); after that, `tsc -p .` type-checks the hooks and tests. Load it again after adding a tool so the generated tool names include it.
 

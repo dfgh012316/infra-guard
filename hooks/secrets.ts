@@ -292,17 +292,33 @@ export async function finishPaste(
   return { text: `secret_set wrote ${p.key}: ${r.result}`, written: true, call }
 }
 
+// Where Claude Code writes a Monitor's or a background command's raw output
+// (<id>.output under tasks/), before any hook sees it: as Claude Code names it,
+// <CLAUDE_CODE_TMPDIR, else the system temp folder>/claude-<uid>.
+export async function claudeTemp($: Engine): Promise<string | undefined> {
+  const id = await $.process.run(['id', '-u'], { timeoutMs: 5_000 }).catch(() => undefined)
+  const uid = id?.exitCode === 0 ? id.stdout.trim() : ''
+  if (!/^\d+$/.test(uid)) return undefined
+  // The engine lists the variables a module reads, so each is named here.
+  const base =
+    (await $.env.get('CLAUDE_CODE_TMPDIR')) || (await $.env.get('TMPDIR')) || (await $.env.get('TMP')) || (await $.env.get('TEMP')) || '/tmp'
+  const trimmed = base.replace(/(.)\/+$/, '$1')
+  return `${trimmed === '/' ? '' : trimmed}/claude-${uid}`
+}
+
 // Answers file names only: the values travel to grep on stdin.
 export async function leakCheck($: Engine, e: Record<string, unknown>) {
   if (known.size === 0) return { result: 'nothing to look for: this load has not minted or read a value yet' }
   const given = e.paths
+  const temp = await claudeTemp($)
   const paths =
     Array.isArray(given) && given.length > 0 && given.every(p => typeof p === 'string' && p.startsWith('/'))
       ? (given as string[])
-      : [`${await $.env.get('HOME')}/.claude`]
+      : [`${await $.env.get('HOME')}/.claude`, ...(temp === undefined ? [] : [temp])]
   const patterns = leakPatterns()
   if (patterns.length === 0) return { result: 'nothing to look for: every value this load holds is too short to search for' }
-  const ran = await $.process.run(['grep', '-rlsF', '-f', '-', '--', ...paths], {
+  // -D skip: a FIFO there would hold grep open (BSD grep reads devices by default).
+  const ran = await $.process.run(['grep', '-rlsF', '-D', 'skip', '-f', '-', '--', ...paths], {
     stdin: `${patterns.join('\n')}\n`,
     timeoutMs: 120_000,
   })
